@@ -32,6 +32,114 @@ except Exception as e:
     mongo_client = None
     db = None
 
+# --- Logic Constants ---
+GRADE_MAP = {
+    "좋음": 0,
+    "보통": 1,
+    "나쁨": 2,
+    "매우나쁨": 3
+}
+
+# Decision Texts
+DECISION_TEXTS = {
+    "infant": {
+        "ok": "오늘은 바깥놀이 괜찮아요 🙂",
+        "caution": "오늘은 짧게 다녀와요!",
+        "warning": "오늘은 실내가 더 편해요 🏠"
+    },
+    "elementary": {
+        "ok": "오늘은 바깥활동 괜찮아요. 다만 물은 꼭!",
+        "caution": "오늘은 밖에 나가도 되는데, 땀나는 운동은 줄이기!",
+        "warning": "오늘은 실내 콘텐츠가 이기는 날!"
+    }
+}
+
+# Action Items templates
+ACTION_ITEMS = {
+    "infant": {
+        "ok": [
+            "가까운 공원에서 가볍게 뛰어놀기",
+            "물 자주 마시기",
+            "집에 오면 손·얼굴 씻기"
+        ],
+        "caution": [
+            "외출은 30분 이내로 짧게",
+            "뛰는 놀이는 잠깐만",
+            "집에서는 블록/역할놀이로 바꿔볼까요?"
+        ],
+        "warning": [
+            "외출 대신 장난감 정리+찾기 게임",
+            "실내에서 풍선배구/장애물 코스(가볍게)",
+            "환기는 짧게(5–10분) 하고 바로 닫기"
+        ]
+    },
+    "elementary": {
+        "ok": [
+            "가벼운 운동",
+            "마스크/손씻기(필요 시)",
+            "귀가 후 샤워/세안"
+        ],
+        "caution": [
+            "체육/뛰기 대신 산책·자전거 천천히",
+            "시간은 짧게(30–60분)",
+            "실내에서는 레고/보드게임/만들기 어때요?"
+        ],
+        "warning": [
+            "밖 대신 미션형 보드게임/만들기 키트",
+            "창문 환기는 짧게",
+            "기침/쌕쌕이면 무리하지 않기(증상 있으면 보호자 판단)"
+        ]
+    }
+}
+
+def _calculate_decision(pm25_grade: str, o3_grade: str) -> str:
+    """
+    Calculate decision level: 'ok', 'caution', 'warning'
+    
+    Logic:
+    • OK: PM2.5 <= 보통 AND O3 <= 보통
+    • Caution: One of them is 나쁨
+    • Warning: One of them is 매우나쁨 OR Both are 나쁨
+    """
+    p_score = GRADE_MAP.get(pm25_grade, 0)
+    o_score = GRADE_MAP.get(o3_grade, 0)
+    
+    # Check Warning Conditions
+    # 1. Any '매우나쁨' (score 3)
+    if p_score >= 3 or o_score >= 3:
+        return "warning"
+    # 2. Both '나쁨' (score 2)
+    if p_score == 2 and o_score == 2:
+        return "warning"
+        
+    # Check Caution Conditions
+    # One is '나쁨' (score 2) - note: the case where both are bad is handled above
+    if p_score == 2 or o_score == 2:
+        return "caution"
+        
+    # Default OK
+    return "ok"
+
+def _get_display_content(age_group: str, decision_key: str):
+    """
+    Returns (decision_text, action_items)
+    """
+    # Normalize age group to key
+    group_key = "elementary" # Default fallback
+    
+    if "유아" in age_group or "0" in age_group or "6" in age_group:
+         group_key = "infant"
+    elif "초등" in age_group or "1" in age_group or "3" in age_group:
+         group_key = "elementary"
+    
+    # Get Text
+    d_text = DECISION_TEXTS.get(group_key, DECISION_TEXTS["elementary"]).get(decision_key, "상태 확인 필요")
+    
+    # Get Actions
+    actions = ACTION_ITEMS.get(group_key, ACTION_ITEMS["elementary"]).get(decision_key, [])
+    
+    return d_text, actions
+
 try:
     vo_client = voyageai.Client(api_key=VOYAGE_API_KEY)
 except Exception as e:
@@ -202,36 +310,52 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
             "actionItems": [],
             "references": []
         }
-        
+
+    # [Logic Update] Calculate Deterministic Decision & Action Items
+    pm25_g = air_data.get("pm25_grade", "보통")
+    o3_g = air_data.get("o3_grade", "보통")
+    
+    decision_key = _calculate_decision(pm25_g, o3_g)
+    decision_text, action_items = _get_display_content(age_group, decision_key)
+    
+    # Logic for dual bad condition text append
+    # "둘 다 높은 경우: 더 나쁜 쪽을 따라가되, 문구는 '둘 다 높아요'로 1줄 추가"
+    # -> If reasoning needs this, we can add it to prompt context or just append to decision text if needed.
+    # The requirement says "문구는 '둘 다 높아요'로 1줄 추가". 
+    # Let's append it to decision text if both are >= '나쁨'.
+    p_score = GRADE_MAP.get(pm25_g, 0)
+    o_score = GRADE_MAP.get(o3_g, 0)
+    if p_score >= 2 and o_score >= 2:
+        decision_text += " (미세먼지와 오존 둘 다 높아요!)"
+
     # Prepare Context
     context_text = "\n".join([f"- [출처: {doc.get('source', '가이드라인')}] {doc.get('text', '')}" for doc in relevant_docs]) if relevant_docs else "관련 의학적 가이드라인을 찾을 수 없습니다."
     
     system_prompt = """
-    당신은 환경보건 의사입니다. 대기질 데이터와 환자의 기저질환 정보를 바탕으로 오늘의 행동 지침을 내려주세요.
+    당신은 환경보건 의사입니다. 대기질 데이터와 환자의 기저질환 정보를 바탕으로 판단 근거(Reason)를 작성해주세요.
     
     [중요]
-    1. 제공된 [의학적 가이드라인] 내용을 최우선으로 반영하여 조언을 작성하세요.
-    2. 가이드라인에 근거가 있다면, 그 내용을 바탕으로 판단 이유를 설명하세요.
+    1. 'decision'과 'actionItems'는 이미 시스템에서 계산되었습니다. 당신은 이 결정이 내려진 '의학적/환경적 이유(reason)'만 작성하면 됩니다.
+    2. 제공된 [의학적 가이드라인] 내용을 최우선으로 반영하여 설명하세요.
     3. 반드시 JSON 형식으로 응답해야 합니다.
     
     응답 포맷:
     {
-        "decision": "O" | "X" | "△",
-        "reason": "판단 근거 (가이드라인 내용 인용 포함)",
-        "actionItems": ["행동요령1", "행동요령2", "행동요령3"]
+        "reason": "판단 근거 (가이드라인 내용 인용 포함)"
     }
     """
     
     user_prompt = f"""
     [상황 정보]
-    - 대기질 상태: {json.dumps(air_data, ensure_ascii=False)}
-    - 사용자 정보: {json.dumps(user_profile, ensure_ascii=False)}
+    - 대기질: PM2.5={pm25_g}, O3={o3_g}
+    - 사용자: {age_group}, {user_condition}
+    - 시스템 결정: {decision_text}
+    - 시스템 행동수칙: {action_items}
     
     [의학적 가이드라인 (참고 문헌)]
     {context_text}
     
-    위 정보를 종합하여 이 사용자에게 맞는 오늘의 행동 지침을 작성해주세요.
-    가이드라인의 내용을 적극적으로 활용하세요.
+    위 결정이 내려진 배경과 이유를 가이드라인을 참고하여 친절하게 설명해주세요.
     """
     
     try:
@@ -242,36 +366,41 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=1 # Reasoning models require temperature=1
+            temperature=1 
         )
         
         content = response.choices[0].message.content
-        result_json = json.loads(content)
+        llm_result = json.loads(content)
         
-        # [Step E] Add References
-        references = list(set([doc.get("source", "Unknown Source") for doc in relevant_docs]))
-        result_json["references"] = references
+        # Merge Results
+        final_result = {
+            "decision": decision_text,
+            "reason": llm_result.get("reason", "정보를 불러오는 중 문제가 발생했습니다."),
+            "actionItems": action_items,
+            "references": list(set([doc.get("source", "Unknown Source") for doc in relevant_docs]))
+        }
         
         # [Step F] Save to Cache
         if db is not None and cache_key:
             try:
                 await db[CACHE_COLLECTION].update_one(
                     {"_id": cache_key},
-                    {"$set": {"data": result_json, "created_at": datetime.now()}},
+                    {"$set": {"data": final_result, "created_at": datetime.now()}},
                     upsert=True
                 )
                 print(f"💾 Saved to cache: {cache_key}")
             except Exception as e:
                 print(f"Error saving to cache: {e}")
                 
-        return result_json
+        return final_result
         
     except Exception as e:
         print(f"Error calling OpenAI: {e}")
+        # Fallback even if LLM fails, we satisfy the deterministic requirement
         return {
-            "decision": "Error",
-            "reason": f"Failed to generate advice: {str(e)}",
-            "actionItems": [],
+            "decision": decision_text,
+            "reason": "일시적인 오류로 상세 설명을 불러오지 못했습니다. 하지만 행동 지침은 위와 같이 준수해주세요.",
+            "actionItems": action_items,
             "references": []
         }
 
