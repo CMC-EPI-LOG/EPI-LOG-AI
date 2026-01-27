@@ -17,6 +17,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DB_NAME = "epilog_db"
 GUIDELINES_COLLECTION = "medical_guidelines"
 AIR_QUALITY_COLLECTION = "daily_air_quality"
+VECTOR_INDEX = "vector_index"
 
 if not MONGO_URI:
     # Fallback to a dummy URI if not set to prevent startup crash, but it will fail on request
@@ -368,7 +369,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
             pipeline = [
                 {
                     "$vectorSearch": {
-                        "index": "default",
+                        "index": VECTOR_INDEX,
                         "path": "embedding",
                         "queryVector": query_vector,
                         "numCandidates": 100,
