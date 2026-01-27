@@ -242,7 +242,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=0.7 # Slight reduction for more adherence to context
+            temperature=1 # Reasoning models require temperature=1
         )
         
         content = response.choices[0].message.content
