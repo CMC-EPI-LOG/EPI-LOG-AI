@@ -23,10 +23,16 @@ Retrieves context-aware medical advice based on air quality and user profile.
 **`userProfile` Schema:**
 ```json
 {
-  "ageGroup": "infant" | "child" | "adult" | "elderly",
+  "ageGroup": "infant" | "elementary_low" | "elementary_high" | "teen",
   "condition": "asthma" | "rhinitis" | "none" | "etc"
 }
 ```
+
+**`ageGroup` Label Guide (KR):**
+- `infant`: 유아
+- `elementary_low`: 초등 저학년
+- `elementary_high`: 초등 고학년
+- `teen`: 청소년
 
 ### Example Request
 ```bash
@@ -34,7 +40,7 @@ curl -X POST "https://<your-domain>/api/advice" \
      -H "Content-Type: application/json" \
      -d '{
            "stationName": "서초구",
-           "userProfile": { "ageGroup": "child", "condition": "asthma" }
+           "userProfile": { "ageGroup": "elementary_high", "condition": "asthma" }
          }'
 ```
 

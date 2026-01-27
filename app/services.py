@@ -47,10 +47,20 @@ DECISION_TEXTS = {
         "caution": "오늘은 짧게 다녀와요!",
         "warning": "오늘은 실내가 더 편해요 🏠"
     },
-    "elementary": {
-        "ok": "오늘은 바깥활동 괜찮아요. 다만 물은 꼭!",
-        "caution": "오늘은 밖에 나가도 되는데, 땀나는 운동은 줄이기!",
-        "warning": "오늘은 실내 콘텐츠가 이기는 날!"
+    "elementary_low": {
+        "ok": "오늘은 밖에서 놀기 좋아요! 물은 꼭 챙기기!",
+        "caution": "오늘은 잠깐만 다녀와요. 땀나는 놀이는 쉬기!",
+        "warning": "오늘은 실내 놀이가 더 좋아요!"
+    },
+    "elementary_high": {
+        "ok": "오늘은 야외활동 괜찮아요. 물 자주 마셔요!",
+        "caution": "오늘은 야외 활동은 가능하지만 강도는 낮게!",
+        "warning": "오늘은 실내 활동이 안전해요."
+    },
+    "teen": {
+        "ok": "오늘은 야외 활동 무리 없어요. 수분 섭취 잊지 마세요.",
+        "caution": "오늘은 야외 운동 강도는 낮추고 시간은 짧게!",
+        "warning": "오늘은 실내 활동이 더 안전합니다."
     }
 }
 
@@ -63,9 +73,9 @@ ACTION_ITEMS = {
             "집에 오면 손·얼굴 씻기"
         ],
         "caution": [
-            "외출은 30분 이내로 짧게",
+            "외출은 20–30분 이내로 짧게",
             "뛰는 놀이는 잠깐만",
-            "집에서는 블록/역할놀이로 바꿔볼까요?"
+            "집에서는 블록/역할놀이로 바꿔보기"
         ],
         "warning": [
             "외출 대신 장난감 정리+찾기 게임",
@@ -73,21 +83,55 @@ ACTION_ITEMS = {
             "환기는 짧게(5–10분) 하고 바로 닫기"
         ]
     },
-    "elementary": {
+    "elementary_low": {
         "ok": [
-            "가벼운 운동",
+            "가벼운 달리기/자전거",
+            "물 자주 마시기",
+            "귀가 후 손씻기/세안"
+        ],
+        "caution": [
+            "땀 많이 나는 놀이는 잠깐만",
+            "외출은 30분 이내",
+            "실내에서는 만들기/보드게임 추천"
+        ],
+        "warning": [
+            "밖 대신 실내 놀이(보드게임/만들기)",
+            "창문 환기는 짧게",
+            "기침/쌕쌕이면 쉬기"
+        ]
+    },
+    "elementary_high": {
+        "ok": [
+            "가벼운 운동이나 산책",
             "마스크/손씻기(필요 시)",
             "귀가 후 샤워/세안"
         ],
         "caution": [
             "체육/뛰기 대신 산책·자전거 천천히",
             "시간은 짧게(30–60분)",
-            "실내에서는 레고/보드게임/만들기 어때요?"
+            "실내에서는 독서/보드게임/만들기"
         ],
         "warning": [
-            "밖 대신 미션형 보드게임/만들기 키트",
+            "야외 활동 대신 실내 활동",
             "창문 환기는 짧게",
-            "기침/쌕쌕이면 무리하지 않기(증상 있으면 보호자 판단)"
+            "호흡기 증상 있으면 무리하지 않기"
+        ]
+    },
+    "teen": {
+        "ok": [
+            "가벼운 운동이나 산책",
+            "마스크/손씻기(필요 시)",
+            "귀가 후 샤워/세안"
+        ],
+        "caution": [
+            "격한 운동은 피하고 강도 낮추기",
+            "외출 시간은 짧게(30–60분)",
+            "실내에서는 스트레칭/가벼운 운동 추천"
+        ],
+        "warning": [
+            "야외 활동 대신 실내 운동",
+            "창문 환기는 짧게",
+            "호흡기 증상 있으면 무리하지 않기"
         ]
     }
 }
@@ -120,23 +164,83 @@ def _calculate_decision(pm25_grade: str, o3_grade: str) -> str:
     # Default OK
     return "ok"
 
+def _normalize_age_group(age_group: Any) -> str:
+    if age_group is None:
+        return "elementary_high"
+    raw = str(age_group).strip().lower()
+    if raw in {
+        "infant",
+        "유아",
+        "영유아",
+        "0-6",
+        "0~6",
+        "0-5",
+        "0~5",
+        "0-3",
+        "0~3"
+    }:
+        return "infant"
+    if raw in {
+        "elementary_low",
+        "초등 저학년",
+        "초등저학년",
+        "1-3",
+        "1~3",
+        "7-9",
+        "7~9"
+    }:
+        return "elementary_low"
+    if raw in {
+        "elementary_high",
+        "초등 고학년",
+        "초등고학년",
+        "4-6",
+        "4~6",
+        "10-12",
+        "10~12"
+    }:
+        return "elementary_high"
+    if raw in {
+        "teen",
+        "청소년",
+        "중등",
+        "고등",
+        "중학생",
+        "고등학생",
+        "13-15",
+        "13~15",
+        "16-18",
+        "16~18"
+    }:
+        return "teen"
+    if raw in {"child", "children", "초등", "아동"}:
+        return "elementary_high"
+    if raw in {"adult", "성인"}:
+        return "teen"
+    if "유아" in raw:
+        return "infant"
+    if "초등" in raw or "아동" in raw:
+        return "elementary_high"
+    if "저학년" in raw:
+        return "elementary_low"
+    if "고학년" in raw:
+        return "elementary_high"
+    if "중등" in raw or "고등" in raw or "청소년" in raw:
+        return "teen"
+    return "elementary_high"
+
 def _get_display_content(age_group: str, decision_key: str):
     """
     Returns (decision_text, action_items)
     """
     # Normalize age group to key
-    group_key = "elementary" # Default fallback
-    
-    if "유아" in age_group or "0" in age_group or "6" in age_group:
-         group_key = "infant"
-    elif "초등" in age_group or "1" in age_group or "3" in age_group:
-         group_key = "elementary"
+    group_key = _normalize_age_group(age_group)
     
     # Get Text
-    d_text = DECISION_TEXTS.get(group_key, DECISION_TEXTS["elementary"]).get(decision_key, "상태 확인 필요")
+    d_text = DECISION_TEXTS.get(group_key, DECISION_TEXTS["elementary_high"]).get(decision_key, "상태 확인 필요")
     
     # Get Actions
-    actions = ACTION_ITEMS.get(group_key, ACTION_ITEMS["elementary"]).get(decision_key, [])
+    actions = ACTION_ITEMS.get(group_key, ACTION_ITEMS["elementary_high"]).get(decision_key, [])
     
     return d_text, actions
 
@@ -202,7 +306,7 @@ def _generate_cache_key(air_data: Dict[str, Any], user_profile: Dict[str, Any]) 
     pm10 = grade_map.get(air_data.get("pm10_grade", ""), 0)
     o3 = grade_map.get(air_data.get("o3_grade", ""), 0) # Added o3 as per user example
     
-    age_group = user_profile.get("ageGroup", "unknown")
+    age_group = _normalize_age_group(user_profile.get("ageGroup"))
     condition = user_profile.get("condition", "unknown")
     
     # Key format: pm25:3_pm10:2_o3:1_age:adult_cond:asthma
@@ -247,7 +351,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         
     # Step B: Query Construction
     user_condition = user_profile.get("condition", "건강함")
-    age_group = user_profile.get("ageGroup", "성인")
+    age_group = _normalize_age_group(user_profile.get("ageGroup"))
     
     # Primary Query: Specific
     search_query = f"{main_condition} 상황에서 {user_condition} {age_group} 행동 요령 주의사항"
