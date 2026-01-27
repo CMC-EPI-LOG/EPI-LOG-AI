@@ -141,47 +141,57 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     user_condition = user_profile.get("condition", "건강함")
     age_group = user_profile.get("ageGroup", "성인")
     
+    # Primary Query: Specific
     search_query = f"{main_condition} 상황에서 {user_condition} {age_group} 행동 요령 주의사항"
-    print(f"Generated Search Query: {search_query}")
+    print(f"Generated Search Query (Primary): {search_query}")
 
     # Step C: Vector Search
     relevant_docs = []
-    if vo_client:
+    if vo_client and db is not None:
         try:
-            # Embed the query
+            # 1. Primary Search
             embed_result = vo_client.embed([search_query], model="voyage-3-large", input_type="query")
             query_vector = embed_result.embeddings[0]
             
-            # MongoDB Vector Search
-            if db is not None:
-                pipeline = [
-                    {
-                        "$vectorSearch": {
-                            "index": "default", # Assuming default index name
-                            "path": "embedding",
-                            "queryVector": query_vector,
-                            "numCandidates": 100,
-                            "limit": 3
-                        }
-                    },
-                    {
-                        "$project": {
-                            "_id": 0,
-                            "text": 1,
-                            "category": 1,
-                            "risk_level": 1,
-                            "source": 1, # [Added] Extract source
-                            "score": {"$meta": "vectorSearchScore"}
-                        }
+            pipeline = [
+                {
+                    "$vectorSearch": {
+                        "index": "default",
+                        "path": "embedding",
+                        "queryVector": query_vector,
+                        "numCandidates": 100,
+                        "limit": 3
                     }
-                ]
+                },
+                {
+                    "$project": {
+                        "_id": 0,
+                        "text": 1,
+                        "category": 1,
+                        "risk_level": 1,
+                        "source": 1,
+                        "score": {"$meta": "vectorSearchScore"}
+                    }
+                }
+            ]
+            
+            cursor = db[GUIDELINES_COLLECTION].aggregate(pipeline)
+            relevant_docs = await cursor.to_list(length=3)
+            
+            # 2. Fallback Search (If no docs found)
+            if not relevant_docs:
+                print("⚠️ Primary search returned no results. Attempting fallback (General) search.")
+                fallback_query = f"{main_condition} 행동 요령"
+                embed_result_fb = vo_client.embed([fallback_query], model="voyage-3-large", input_type="query")
+                query_vector_fb = embed_result_fb.embeddings[0]
+                
+                pipeline[0]["$vectorSearch"]["queryVector"] = query_vector_fb
                 
                 cursor = db[GUIDELINES_COLLECTION].aggregate(pipeline)
                 relevant_docs = await cursor.to_list(length=3)
                 
         except Exception as e:
             print(f"Error during vector search: {e}")
-            # Fallback or continue with empty docs
             pass
 
     # Step D: LLM Generation
@@ -194,15 +204,20 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         }
         
     # Prepare Context
-    context_text = "\n".join([f"- {doc.get('text', '')}" for doc in relevant_docs])
+    context_text = "\n".join([f"- [출처: {doc.get('source', '가이드라인')}] {doc.get('text', '')}" for doc in relevant_docs]) if relevant_docs else "관련 의학적 가이드라인을 찾을 수 없습니다."
     
     system_prompt = """
     당신은 환경보건 의사입니다. 대기질 데이터와 환자의 기저질환 정보를 바탕으로 오늘의 행동 지침을 내려주세요.
-    반드시 JSON 형식으로 응답해야 합니다.
+    
+    [중요]
+    1. 제공된 [의학적 가이드라인] 내용을 최우선으로 반영하여 조언을 작성하세요.
+    2. 가이드라인에 근거가 있다면, 그 내용을 바탕으로 판단 이유를 설명하세요.
+    3. 반드시 JSON 형식으로 응답해야 합니다.
+    
     응답 포맷:
     {
-        "decision": "O" | "X" | "△",  // O: 활동 가능, X: 외출 자제/금지, △: 주의 필요
-        "reason": "판단 근거 (한 문장 요약)",
+        "decision": "O" | "X" | "△",
+        "reason": "판단 근거 (가이드라인 내용 인용 포함)",
         "actionItems": ["행동요령1", "행동요령2", "행동요령3"]
     }
     """
@@ -212,10 +227,11 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     - 대기질 상태: {json.dumps(air_data, ensure_ascii=False)}
     - 사용자 정보: {json.dumps(user_profile, ensure_ascii=False)}
     
-    [의학적 가이드라인 (참고)]
+    [의학적 가이드라인 (참고 문헌)]
     {context_text}
     
     위 정보를 종합하여 이 사용자에게 맞는 오늘의 행동 지침을 작성해주세요.
+    가이드라인의 내용을 적극적으로 활용하세요.
     """
     
     try:
@@ -226,7 +242,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=1
+            temperature=0.7 # Slight reduction for more adherence to context
         )
         
         content = response.choices[0].message.content
