@@ -1,0 +1,26 @@
+[
+  {
+    "text": "미세먼지 농도가 '나쁨' 수준일 경우, 천식 환자는 외출을 자제하고 부득이한 외출 시 보건용 마스크(KF80 이상)를 착용해야 합니다. 실내에서는 창문을 닫고 공기청정기를 가동하여 실내 공기질을 관리하세요.",
+    "category": "asthma",
+    "risk_level": "high",
+    "condition": "fine_dust_bad"
+  },
+  {
+    "text": "초미세먼지 주의보 발령 시, 호흡기 질환이 있는 유아는 야외 활동을 금지해야 합니다. 충분한 수분 섭취를 통해 노폐물 배출을 돕고, 귀가 후에는 손 씻기와 양치질을 철저히 해야 합니다.",
+    "category": "infant_respiratory",
+    "risk_level": "very_high",
+    "condition": "ultrafine_dust_warning"
+  },
+  {
+    "text": "황사 경보가 내려진 경우, 알레르기 비염 환자는 생리식염수로 코 세척을 아침 저녁으로 실시하는 것이 좋습니다. 외출 시 안경과 모자를 착용하여 황사와의 접촉을 최소화하세요.",
+    "category": "allergic_rhinitis",
+    "risk_level": "high",
+    "condition": "yellow_dust_alert"
+  },
+  {
+    "text": "대기질이 '보통' 수준이더라도 민감군(노약자, 어린이, 임산부)은 장시간의 실외 무리한 활동을 자제하는 것이 좋습니다. 주기적으로 환기를 시키되, 도로변 등 오염원이 많은 곳은 피하세요.",
+    "category": "sensitive_group",
+    "risk_level": "moderate",
+    "condition": "air_quality_moderate"
+  }
+]

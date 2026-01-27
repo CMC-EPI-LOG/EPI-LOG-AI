@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+motor
+pymongo
+voyageai
+openai
+python-dotenv
+pypdf2
+python-multipart
