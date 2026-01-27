@@ -13,6 +13,13 @@ class AdviceRequest(BaseModel):
     stationName: str
     userProfile: Dict[str, Any]
 
+# Define Response Model
+class AdviceResponse(BaseModel):
+    decision: str
+    reason: str
+    actionItems: List[str]
+    references: List[str]
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup logic
@@ -30,7 +37,7 @@ app = FastAPI(title="Epilogue API", lifespan=lifespan)
 def read_root():
     return {"status": "ok", "service": "Epilogue API"}
 
-@app.post("/api/advice")
+@app.post("/api/advice", response_model=AdviceResponse)
 async def give_advice(request: AdviceRequest):
     try:
         # Delegate logic to service layer
@@ -43,7 +50,9 @@ async def give_advice(request: AdviceRequest):
             content={
                 "decision": "Error",
                 "reason": "Internal Server Error",
-                "details": str(e)
+                "details": str(e),
+                "actionItems": [],
+                "references": []
             }
         )
 

@@ -85,18 +85,48 @@ async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
         print(f"Error fetching air quality: {e}")
         raise e
 
+CACHE_COLLECTION = "rag_cache"
+
+def _generate_cache_key(air_data: Dict[str, Any], user_profile: Dict[str, Any]) -> str:
+    grade_map = {"좋음": 1, "보통": 2, "나쁨": 3, "매우나쁨": 4}
+    
+    pm25 = grade_map.get(air_data.get("pm25_grade", ""), 0)
+    pm10 = grade_map.get(air_data.get("pm10_grade", ""), 0)
+    o3 = grade_map.get(air_data.get("o3_grade", ""), 0) # Added o3 as per user example
+    
+    age_group = user_profile.get("ageGroup", "unknown")
+    condition = user_profile.get("condition", "unknown")
+    
+    # Key format: pm25:3_pm10:2_o3:1_age:adult_cond:asthma
+    return f"pm25:{pm25}_pm10:{pm10}_o3:{o3}_age:{age_group}_cond:{condition}"
+
 async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) -> Dict[str, Any]:
     """
     Main orchestration function:
     1. Get Air Quality
-    2. Construct Query
-    3. Vector Search
-    4. Generate Advice with LLM
+    2. Check Cache
+    3. Construct Query
+    4. Vector Search
+    5. Generate Advice with LLM
+    6. Save to Cache & Return
     """
     # Step A: Get Air Quality
     air_data = await get_air_quality(station_name)
     if not air_data:
         raise ValueError(f"No air quality data found for station: {station_name}")
+
+    cache_key = ""
+    # [Step A.1] Check Cache
+    if db is not None:
+        try:
+            cache_key = _generate_cache_key(air_data, user_profile)
+            cached_entry = await db[CACHE_COLLECTION].find_one({"_id": cache_key})
+            
+            if cached_entry:
+                print(f"✅ Cache Hit! Key: {cache_key}")
+                return cached_entry["data"]
+        except Exception as e:
+            print(f"⚠️ Cache check failed: {e}")
 
     # Determine main issue (simplified logic)
     main_condition = "보통"
@@ -140,6 +170,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
                             "text": 1,
                             "category": 1,
                             "risk_level": 1,
+                            "source": 1, # [Added] Extract source
                             "score": {"$meta": "vectorSearchScore"}
                         }
                     }
@@ -158,7 +189,8 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
          return {
             "decision": "Error",
             "reason": "OpenAI Client not initialized",
-            "actionItems": []
+            "actionItems": [],
+            "references": []
         }
         
     # Prepare Context
@@ -198,14 +230,33 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         )
         
         content = response.choices[0].message.content
-        return json.loads(content)
+        result_json = json.loads(content)
+        
+        # [Step E] Add References
+        references = list(set([doc.get("source", "Unknown Source") for doc in relevant_docs]))
+        result_json["references"] = references
+        
+        # [Step F] Save to Cache
+        if db is not None and cache_key:
+            try:
+                await db[CACHE_COLLECTION].update_one(
+                    {"_id": cache_key},
+                    {"$set": {"data": result_json, "created_at": datetime.now()}},
+                    upsert=True
+                )
+                print(f"💾 Saved to cache: {cache_key}")
+            except Exception as e:
+                print(f"Error saving to cache: {e}")
+                
+        return result_json
         
     except Exception as e:
         print(f"Error calling OpenAI: {e}")
         return {
             "decision": "Error",
             "reason": f"Failed to generate advice: {str(e)}",
-            "actionItems": []
+            "actionItems": [],
+            "references": []
         }
 
 async def ingest_pdf(file_content: bytes, filename: str) -> Dict[str, Any]:
