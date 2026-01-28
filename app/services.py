@@ -1,6 +1,7 @@
 import os
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional, Any
 import voyageai
 from openai import OpenAI
@@ -18,6 +19,7 @@ DB_NAME = "epilog_db"
 GUIDELINES_COLLECTION = "medical_guidelines"
 AIR_QUALITY_COLLECTION = "daily_air_quality"
 VECTOR_INDEX = "vector_index"
+KST_TZ = ZoneInfo("Asia/Seoul")
 
 if not MONGO_URI:
     # Fallback to a dummy URI if not set to prevent startup crash, but it will fail on request
@@ -264,7 +266,7 @@ async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
     if db is None:
         raise Exception("Database connection not initialized")
         
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now(KST_TZ).strftime("%Y-%m-%d")
     
     # Try to find today's data for the station
     # Note: In a real scenario, you might need to query an external API if DB doesn't have it.
@@ -299,6 +301,8 @@ async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
         raise e
 
 CACHE_COLLECTION = "rag_cache"
+CACHE_TTL_SECONDS = 60 * 60 * 30  # 30 hours
+_cache_ttl_index_ready = False
 
 def _generate_cache_key(air_data: Dict[str, Any], user_profile: Dict[str, Any]) -> str:
     grade_map = {"좋음": 1, "보통": 2, "나쁨": 3, "매우나쁨": 4}
@@ -309,9 +313,24 @@ def _generate_cache_key(air_data: Dict[str, Any], user_profile: Dict[str, Any]) 
     
     age_group = _normalize_age_group(user_profile.get("ageGroup"))
     condition = user_profile.get("condition", "unknown")
+    date_key = air_data.get("date") or datetime.now(KST_TZ).strftime("%Y-%m-%d")
     
-    # Key format: pm25:3_pm10:2_o3:1_age:adult_cond:asthma
-    return f"pm25:{pm25}_pm10:{pm10}_o3:{o3}_age:{age_group}_cond:{condition}"
+    # Key format: pm25:3_pm10:2_o3:1_age:adult_cond:asthma_date:2026-01-28
+    return f"pm25:{pm25}_pm10:{pm10}_o3:{o3}_age:{age_group}_cond:{condition}_date:{date_key}"
+
+async def _ensure_cache_ttl_index():
+    global _cache_ttl_index_ready
+    if _cache_ttl_index_ready or db is None:
+        return
+    try:
+        await db[CACHE_COLLECTION].create_index(
+            "created_at",
+            expireAfterSeconds=CACHE_TTL_SECONDS,
+            name="rag_cache_ttl"
+        )
+        _cache_ttl_index_ready = True
+    except Exception as e:
+        print(f"⚠️ Cache TTL index creation failed: {e}")
 
 async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -332,6 +351,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     # [Step A.1] Check Cache
     if db is not None:
         try:
+            await _ensure_cache_ttl_index()
             cache_key = _generate_cache_key(air_data, user_profile)
             cached_entry = await db[CACHE_COLLECTION].find_one({"_id": cache_key})
             
@@ -490,7 +510,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
             try:
                 await db[CACHE_COLLECTION].update_one(
                     {"_id": cache_key},
-                    {"$set": {"data": final_result, "created_at": datetime.now()}},
+                    {"$set": {"data": final_result, "created_at": datetime.now(KST_TZ)}},
                     upsert=True
                 )
                 print(f"💾 Saved to cache: {cache_key}")
