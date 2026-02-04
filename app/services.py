@@ -37,215 +37,311 @@ except Exception as e:
 
 # --- Logic Constants ---
 GRADE_MAP = {
-    "좋음": 0,
-    "보통": 1,
-    "나쁨": 2,
-    "매우나쁨": 3
+    "좋음": 1,
+    "보통": 2,
+    "나쁨": 3,
+    "매우나쁨": 4
 }
 
-# Decision Texts
+REVERSE_GRADE_MAP = {v: k for k, v in GRADE_MAP.items()}
+
+# Correction Weights
+HUMIDITY_WEIGHTS = {
+    "high": 1.2,  # > 70%
+    "low": 1.1,   # < 30%
+    "normal": 1.0
+}
+
+def _get_corrected_grade(
+    base_grade: str, 
+    temp: Optional[float], 
+    humidity: Optional[float], 
+    condition: str,
+    pollutant_type: str # "pm25" or "o3"
+) -> str:
+    """
+    Apply correction logic based on temperature, humidity and disease condition.
+    Returns the corrected grade string.
+    """
+    score = GRADE_MAP.get(base_grade, 2)
+    
+    # 1. Humidity Correction (W_h)
+    w_h = 1.0
+    if humidity is not None:
+        if humidity > 70:
+            w_h = HUMIDITY_WEIGHTS["high"]
+        elif humidity < 30:
+            w_h = HUMIDITY_WEIGHTS["low"]
+    
+    # 2. Temperature & Disease Trigger Logic
+    # Asthma + Cold + PM2.5
+    if condition == "asthma" and temp is not None and temp < 5 and pollutant_type == "pm25":
+        if base_grade == "보통": return "나쁨"
+        
+    # Rhinitis + Dry + PM2.5
+    if condition == "rhinitis" and humidity is not None and humidity < 30 and pollutant_type == "pm25":
+        if base_grade == "보통": return "나쁨"
+        
+    # Atopy + Heat + O3
+    if condition == "atopy" and temp is not None and temp > 30 and pollutant_type == "o3":
+        if base_grade == "보통": return "나쁨"
+        
+    # General + High Humidity + PM2.5 Bad
+    if humidity is not None and humidity > 80 and pollutant_type == "pm25" and base_grade == "나쁨":
+        return "매우나쁨"
+
+    # Apply multiplicative weight if no specific trigger fired
+    # (Simplified: if score * w_h rounds up to next grade)
+    final_score = min(4, max(1, round(score * w_h)))
+    return REVERSE_GRADE_MAP.get(final_score, base_grade)
+
+# Decision Texts based on 80-segment dataset
 DECISION_TEXTS = {
     "infant": {
-        "ok": "오늘은 바깥놀이 괜찮아요 🙂",
-        "caution": "오늘은 짧게 다녀와요!",
-        "warning": "오늘은 실내가 더 편해요 🏠"
+        "general": {
+            "ok": "유모차 산책 가요!",
+            "caution": "짧은 산책만 추천해요",
+            "warning": "실내가 더 안전해요"
+        },
+        "rhinitis": {
+            "ok": "코가 편안한 날이에요",
+            "caution": "코점막 보습에 집중",
+            "warning": "콧물 유발 주의보"
+        },
+        "asthma": {
+            "ok": "상쾌하게 숨 쉬어요",
+            "caution": "찬 바람 노출 주의",
+            "warning": "쌕쌕거림 모니터링"
+        },
+        "atopy": {
+            "ok": "피부 가려움 걱정 뚝",
+            "caution": "땀나면 바로 닦아주세요",
+            "warning": "외부 먼지 접촉 차단"
+        }
+    },
+    "toddler": {
+        "general": {
+            "ok": "놀이터에서 뛰놀아요",
+            "caution": "물 한 컵 마시고 나가기",
+            "warning": "실외 놀이는 짧게"
+        },
+        "rhinitis": {
+            "ok": "코 면역력 키우는 날",
+            "caution": "재채기 유도 먼지 조심",
+            "warning": "입 대신 코로 숨 쉬기"
+        },
+        "asthma": {
+            "ok": "기도가 열리는 날씨",
+            "caution": "갑작스런 기침 주의",
+            "warning": "격렬한 운동 금지"
+        },
+        "atopy": {
+            "ok": "피부가 숨 쉬는 날",
+            "caution": "땀과 먼지를 멀리해요",
+            "warning": "땀 닦고 바로 보습"
+        }
     },
     "elementary_low": {
-        "ok": "오늘은 밖에서 놀기 좋아요! 물은 꼭 챙기기!",
-        "caution": "오늘은 잠깐만 다녀와요. 땀나는 놀이는 쉬기!",
-        "warning": "오늘은 실내 놀이가 더 좋아요!"
+        "general": {
+            "ok": "운동장에서 마음껏!",
+            "caution": "체육 전 상태 확인",
+            "warning": "실외 체육은 쉬어가요"
+        },
+        "rhinitis": {
+            "ok": "숲 체험 가기 좋은 날",
+            "caution": "마스크 쓰고 등교하기",
+            "warning": "재채기/안구 증상 주의"
+        },
+        "asthma": {
+            "ok": "컨디션 최상인 날",
+            "caution": "운동 강도를 조절해요",
+            "warning": "운동 강도 조절 필수"
+        },
+        "atopy": {
+            "ok": "자외선 차단제 필수",
+            "caution": "긴소매로 피부 보호",
+            "warning": "긁지 않게 시원하게"
+        }
     },
     "elementary_high": {
-        "ok": "오늘은 야외활동 괜찮아요. 물 자주 마셔요!",
-        "caution": "오늘은 야외 활동은 가능하지만 강도는 낮게!",
-        "warning": "오늘은 실내 활동이 안전해요."
+        "general": {
+            "ok": "야외활동 괜찮아요",
+            "caution": "등하교 시 상태 확인",
+            "warning": "KF80 마스크 필수 (고농도는 폐 성장에 영향을 줘요)"
+        },
+        "rhinitis": {
+            "ok": "맑은 공기로 코 정화",
+            "caution": "마스크 휴대 추천",
+            "warning": "입 대신 코로 숨 쉬기"
+        },
+        "asthma": {
+            "ok": "야외활동 무리 없어요",
+            "caution": "운동 강도 50% 하향",
+            "warning": "기도 염증 예방 주의 (실외 이동 전면 제한)"
+        },
+        "atopy": {
+            "ok": "피부 장벽 안심 날",
+            "caution": "땀과 먼지 접촉 주의",
+            "warning": "즉각적인 피부 세정 필요"
+        }
     },
-    "teen": {
-        "ok": "오늘은 야외 활동 무리 없어요. 수분 섭취 잊지 마세요.",
-        "caution": "오늘은 야외 운동 강도는 낮추고 시간은 짧게!",
-        "warning": "오늘은 실내 활동이 더 안전합니다."
+    "teen_adult": {
+        "general": {
+            "ok": "야외 활동 무리 없어요",
+            "caution": "운동 강도는 낮추고 시간은 짧게",
+            "warning": "실내 활동이 더 안전합니다"
+        },
+        "rhinitis": {
+            "ok": "코가 편안한 날입니다",
+            "caution": "생리식염수 코 세척 권장",
+            "warning": "외출 후 콧속 미세먼지 세정 (공기청정기 가동)"
+        },
+        "asthma": {
+            "ok": "상쾌한 호흡 가능",
+            "caution": "야외 러닝 강도 조절",
+            "warning": "야외 활동 전면 금지"
+        },
+        "atopy": {
+            "ok": "피부 가려움 안심",
+            "caution": "자극 성분 접촉 주의",
+            "warning": "먼지 접촉 피하기 (즉각적인 세정과 보습)"
+        }
     }
 }
 
 # Action Items templates
 ACTION_ITEMS = {
     "infant": {
-        "ok": [
-            "가까운 공원에서 가볍게 뛰어놀기",
-            "물 자주 마시기",
-            "집에 오면 손·얼굴 씻기"
-        ],
-        "caution": [
-            "외출은 20–30분 이내로 짧게",
-            "뛰는 놀이는 잠깐만",
-            "집에서는 블록/역할놀이로 바꿔보기"
-        ],
-        "warning": [
-            "외출 대신 장난감 정리+찾기 게임",
-            "실내에서 풍선배구/장애물 코스(가볍게)",
-            "환기는 짧게(5–10분) 하고 바로 닫기"
-        ]
+        "general": {
+            "ok": ["유모차 산책", "15분 환기", "복귀 후 손발 씻기"],
+            "caution": ["유모차 커버 사용", "그늘 산책", "복귀 후 보습"],
+            "warning": ["창문 닫기/밀폐", "공기청정기 가동", "습도 50% 유지/물걸레 청소"]
+        },
+        "rhinitis": {
+            "ok": ["쾌적한 환기", "먼지 털기", "가벼운 외출"],
+            "caution": ["가습기 가동", "미지근한 물 마시기", "외출 가림막"],
+            "warning": ["실외 활동 자제/실내 대기", "식염수 코 세정", "상비약 확인"]
+        },
+        "asthma": {
+            "ok": ["신선한 공기 유지", "보호자 산책", "충분한 휴식"],
+            "caution": ["목 가싸개 사용", "온도 변화 주의", "상태 관찰"],
+            "warning": ["격렬한 놀이 금지", "습도 55% 유지", "비상약 확인/대응 준비"]
+        },
+        "atopy": {
+            "ok": ["외출 전 선크림", "활동 후 세안", "면 소재 옷"],
+            "caution": ["휴대 손수건 지참", "보습제 바르기", "얇은 긴소매"],
+            "warning": ["외출 최소화/실내 체류", "귀가 즉시 샤워", "고보습 크림/시원한 온도 유지"]
+        }
+    },
+    "toddler": {
+        "general": {
+            "ok": ["야외 놀이 권장", "전면 환기", "활동 후 수분 섭취"],
+            "caution": ["물 자주 마시기", "마스크 휴대", "장시간 체류 자제"],
+            "warning": ["소형 마스크 밀착", "실내 놀이 위주", "야외 활동 금지/공청기 사용"]
+        },
+        "rhinitis": {
+            "ok": ["숲 체험 추천", "환기 후 청소", "외출 후 세안"],
+            "caution": ["마스크 필수", "코 주변 보습", "식염수 세척"],
+            "warning": ["외출 후 코 세척", "실내 먼지 제거", "절대 실내 대기/증상 시 약 복용"]
+        },
+        "asthma": {
+            "ok": ["유산소 놀이", "규칙적 약 복용", "기관 환기"],
+            "caution": ["운동 강도 낮추기", "중간 휴식", "호흡 상태 확인"],
+            "warning": ["저강도 놀이 전환", "흡입기 지참", "외출 금지/비상 시 병원 방문"]
+        },
+        "atopy": {
+            "ok": ["선크림 도포", "산책 후 가벼운 샤워", "면 소재 옷"],
+            "caution": ["수시로 땀 닦기", "외출 후 보습", "긴소매 겉옷"],
+            "warning": ["휴대용 보습제", "외출 후 즉시 샤워", "냉찜질/자극 없는 로션"]
+        }
     },
     "elementary_low": {
-        "ok": [
-            "가벼운 달리기/자전거",
-            "물 자주 마시기",
-            "귀가 후 손씻기/세안"
-        ],
-        "caution": [
-            "땀 많이 나는 놀이는 잠깐만",
-            "외출은 30분 이내",
-            "실내에서는 만들기/보드게임 추천"
-        ],
-        "warning": [
-            "밖 대신 실내 놀이(보드게임/만들기)",
-            "창문 환기는 짧게",
-            "기침/쌕쌕이면 쉬기"
-        ]
+        "general": {
+            "ok": ["운동장에서 마음껏", "교실 전면 환기", "야외 학습"],
+            "caution": ["중간 수분 섭취", "활동 후 양치", "대기질 체크"],
+            "warning": ["KF80 마스크 필수", "실내 체육 대체", "방과 후 즉시 귀가"]
+        },
+        "rhinitis": {
+            "ok": ["야외 산책", "환기 후 대청소", "충분한 휴식"],
+            "caution": ["마스크 휴대", "손 씻기 교육", "물 자주 마시기"],
+            "warning": ["안구 세정", "마스크 필착", "외출 후 머리카락 털기"]
+        },
+        "asthma": {
+            "ok": ["학교 체육 참여", "깊은 호흡 운동", "컨디션 유지"],
+            "caution": ["무리한 달리기 자제", "중간 휴식", "호흡 모니터링"],
+            "warning": ["상비약 휴대 확인", "교사에게 미리 알리기", "노출 전면 차단"]
+        },
+        "atopy": {
+            "ok": ["선크림 바르기", "야외 활동 즐기기", "활동 후 세안"],
+            "caution": ["손수건 지참", "외출 후 보습제", "면 속옷 입히기"],
+            "warning": ["미스트 사용", "통풍되는 옷", "냉찜질 진정/실내 습도 조절"]
+        }
     },
     "elementary_high": {
-        "ok": [
-            "가벼운 운동이나 산책",
-            "마스크/손씻기(필요 시)",
-            "귀가 후 샤워/세안"
-        ],
-        "caution": [
-            "체육/뛰기 대신 산책·자전거 천천히",
-            "시간은 짧게(30–60분)",
-            "실내에서는 독서/보드게임/만들기"
-        ],
-        "warning": [
-            "야외 활동 대신 실내 활동",
-            "창문 환기는 짧게",
-            "호흡기 증상 있으면 무리하지 않기"
-        ]
+        "general": {
+            "ok": ["비타민 C 섭취", "야외 활동 권장", "귀가 후 세안"],
+            "caution": ["학원 이동 시 천천히", "마스크 착용", "수분 섭취"],
+            "warning": ["KF80 마스크 필수", "격렬한 운동 자제", "실외 노출 최소화"]
+        },
+        "asthma": {
+            "ok": ["정상적인 체육 활동", "충분한 수분", "규칙적 약 복용"],
+            "caution": ["운동 강도 조절", "중간중간 휴식", "증상 발생 시 중단"],
+            "warning": ["격렬한 운동 금지", "흡입기 필수 지참", "실외 이동 전면 제한"]
+        },
+        "rhinitis": {
+            "ok": ["코로 숨쉬기 집중", "환기 및 청소", "코 세척"],
+            "caution": ["텀블러 지참", "먼지 많은 곳 피하기", "손 씻기"],
+            "warning": ["식염수 코 세척", "눈 비비지 않기", "인공눈물 사용"]
+        },
+        "atopy": {
+            "ok": ["보습제 도포", "면 소재 내의", "충분한 수면"],
+            "caution": ["땀 닦는 수건 필수", "보습제 덧바르기", "통풍되는 옷"],
+            "warning": ["미지근한 물 샤워", "급격한 온도변화 주의", "약산성 클렌저 세안"]
+        }
     },
-    "teen": {
-        "ok": [
-            "가벼운 운동이나 산책",
-            "마스크/손씻기(필요 시)",
-            "귀가 후 샤워/세안"
-        ],
-        "caution": [
-            "격한 운동은 피하고 강도 낮추기",
-            "외출 시간은 짧게(30–60분)",
-            "실내에서는 스트레칭/가벼운 운동 추천"
-        ],
-        "warning": [
-            "야외 활동 대신 실내 운동",
-            "창문 환기는 짧게",
-            "호흡기 증상 있으면 무리하지 않기"
-        ]
+    "teen_adult": {
+        "general": {
+            "ok": ["정상적인 활동 가능", "충분한 수면", "수분 섭취"],
+            "caution": ["야외 운동 강도 하향", "마스크 휴대", "장시간 노출 자제"],
+            "warning": ["야외 활동 대신 실내", "창문 밀폐", "호흡기 증상 관찰"]
+        },
+        "rhinitis": {
+            "ok": ["환기 및 실내 정화", "충분한 휴식", "코 세척"],
+            "caution": ["외출 시 마스크 필수", "코 주변 보습", "물 자주 마시기"],
+            "warning": ["식염수 코 세척", "귀가 즉시 세안", "공기청정기 풀가동"]
+        },
+        "asthma": {
+            "ok": ["유산소 운동 권장", "컨디션 관리", "정기 검진"],
+            "caution": ["야외 활동 시간 단축", "흡입기 소지", "무리한 운동 금지"],
+            "warning": ["외출 전면 금지", "실내 습도 조절", "증상 악화 시 내원"]
+        },
+        "atopy": {
+            "ok": ["고보습 크림 사용", "자극 없는 세안", "충분한 수분"],
+            "caution": ["땀 분비 시 즉시 닦기", "보습제 수시 도포", "면 소재 의류"],
+            "warning": ["약산성 클렌저 사용", "즉각적인 피부 진정", "노출 부위 최소화"]
+        }
     }
 }
 
-def _calculate_decision(pm25_grade: str, o3_grade: str) -> str:
-    """
-    Calculate decision level: 'ok', 'caution', 'warning'
-    
-    Logic:
-    • OK: PM2.5 <= 보통 AND O3 <= 보통
-    • Caution: One of them is 나쁨
-    • Warning: One of them is 매우나쁨 OR Both are 나쁨
-    """
-    p_score = GRADE_MAP.get(pm25_grade, 0)
-    o_score = GRADE_MAP.get(o3_grade, 0)
-    
-    # Check Warning Conditions
-    # 1. Any '매우나쁨' (score 3)
-    if p_score >= 3 or o_score >= 3:
-        return "warning"
-    # 2. Both '나쁨' (score 2)
-    if p_score == 2 and o_score == 2:
-        return "warning"
-        
-    # Check Caution Conditions
-    # One is '나쁨' (score 2) - note: the case where both are bad is handled above
-    if p_score == 2 or o_score == 2:
-        return "caution"
-        
-    # Default OK
-    return "ok"
 
-def _normalize_age_group(age_group: Any) -> str:
-    if age_group is None:
-        return "elementary_high"
-    raw = str(age_group).strip().lower()
-    if raw in {
-        "infant",
-        "유아",
-        "영유아",
-        "0-6",
-        "0~6",
-        "0-5",
-        "0~5",
-        "0-3",
-        "0~3"
-    }:
-        return "infant"
-    if raw in {
-        "elementary_low",
-        "초등 저학년",
-        "초등저학년",
-        "1-3",
-        "1~3",
-        "7-9",
-        "7~9"
-    }:
-        return "elementary_low"
-    if raw in {
-        "elementary_high",
-        "초등 고학년",
-        "초등고학년",
-        "4-6",
-        "4~6",
-        "10-12",
-        "10~12"
-    }:
-        return "elementary_high"
-    if raw in {
-        "teen",
-        "청소년",
-        "중등",
-        "고등",
-        "중학생",
-        "고등학생",
-        "13-15",
-        "13~15",
-        "16-18",
-        "16~18"
-    }:
-        return "teen"
-    if raw in {"child", "children", "초등", "아동"}:
-        return "elementary_high"
-    if raw in {"adult", "성인"}:
-        return "teen"
-    if "유아" in raw:
-        return "infant"
-    if "초등" in raw or "아동" in raw:
-        return "elementary_high"
-    if "저학년" in raw:
-        return "elementary_low"
-    if "고학년" in raw:
-        return "elementary_high"
-    if "중등" in raw or "고등" in raw or "청소년" in raw:
-        return "teen"
-    return "elementary_high"
-
-def _get_display_content(age_group: str, decision_key: str):
+def _get_display_content(age_group: str, condition: str, decision_key: str):
     """
     Returns (decision_text, action_items)
     """
-    # Normalize age group to key
-    group_key = _normalize_age_group(age_group)
+    # Normalize condition
+    cond_key = condition if condition in ["general", "rhinitis", "asthma", "atopy"] else "general"
     
     # Get Text
-    d_text = DECISION_TEXTS.get(group_key, DECISION_TEXTS["elementary_high"]).get(decision_key, "상태 확인 필요")
+    group_data = DECISION_TEXTS.get(age_group, DECISION_TEXTS["elementary_high"])
+    cond_data = group_data.get(cond_key, group_data.get("general", {}))
+    d_text = cond_data.get(decision_key, "상태 확인 필요")
     
     # Get Actions
-    actions = ACTION_ITEMS.get(group_key, ACTION_ITEMS["elementary_high"]).get(decision_key, [])
+    group_actions = ACTION_ITEMS.get(age_group, ACTION_ITEMS.get("toddler", {}))
+    cond_actions = group_actions.get(cond_key, group_actions.get("general", {}))
+    actions = cond_actions.get(decision_key, ["상태에 따른 주의가 필요합니다."])
     
-    return d_text, actions
+    return d_text, actions[:] # Return a copy
 
 try:
     vo_client = voyageai.Client(api_key=VOYAGE_API_KEY)
@@ -279,6 +375,9 @@ async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
         })
         
         if result:
+            # Inject mock weather data if not present in the real record
+            if "temp" not in result: result["temp"] = 22.0
+            if "humidity" not in result: result["humidity"] = 45.0
             return result
             
         # Mock data if not found (for demonstration purposes as requested structure implies data exists)
@@ -293,9 +392,10 @@ async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
             "o3_grade": "보통",
             "no2_grade": "좋음",
             "so2_grade": "좋음",
-            "integrated_grade": "나쁨"
+            "integrated_grade": "나쁨",
+            "temp": 22.0,       # Added temp
+            "humidity": 45.0    # Added humidity
         }
-        
     except Exception as e:
         print(f"Error fetching air quality: {e}")
         raise e
@@ -334,25 +434,34 @@ async def _ensure_cache_ttl_index():
 
 async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Main orchestration function:
-    1. Get Air Quality
-    2. Check Cache
-    3. Construct Query
-    4. Vector Search
-    5. Generate Advice with LLM
-    6. Save to Cache & Return
+    Main orchestration function with correction logic.
     """
     # Step A: Get Air Quality
     air_data = await get_air_quality(station_name)
     if not air_data:
         raise ValueError(f"No air quality data found for station: {station_name}")
 
+    # Extract Weather Info for Correction
+    temp = air_data.get("temp")
+    humidity = air_data.get("humidity")
+    user_condition = user_profile.get("condition", "건강함")
+    age_group_raw = user_profile.get("ageGroup")
+    age_group = _normalize_age_group(age_group_raw)
+
+    # Apply Correction Logic to get "Sensed" grades
+    pm25_raw = air_data.get("pm25_grade", "보통")
+    o3_raw = air_data.get("o3_grade", "보통")
+    
+    pm25_corrected = _get_corrected_grade(pm25_raw, temp, humidity, user_condition, "pm25")
+    o3_corrected = _get_corrected_grade(o3_raw, temp, humidity, user_condition, "o3")
+
     cache_key = ""
     # [Step A.1] Check Cache
     if db is not None:
         try:
             await _ensure_cache_ttl_index()
-            cache_key = _generate_cache_key(air_data, user_profile)
+            # Simple key extension: add T/H to capture environmental context
+            cache_key = _generate_cache_key(air_data, user_profile) + f"_T:{temp}_H:{humidity}"
             cached_entry = await db[CACHE_COLLECTION].find_one({"_id": cache_key})
             
             if cached_entry:
@@ -361,20 +470,16 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         except Exception as e:
             print(f"⚠️ Cache check failed: {e}")
 
-    # Determine main issue (simplified logic)
+    # Determine main issue for search (using corrected grades)
     main_condition = "보통"
-    if air_data.get("pm25_grade") in ["나쁨", "매우나쁨"]:
-        main_condition = f"초미세먼지 {air_data['pm25_grade']}"
+    if pm25_corrected in ["나쁨", "매우나쁨"]:
+        main_condition = f"초미세먼지 {pm25_corrected}"
     elif air_data.get("pm10_grade") in ["나쁨", "매우나쁨"]:
         main_condition = f"미세먼지 {air_data['pm10_grade']}"
-    elif air_data.get("so2_grade") in ["나쁨", "매우나쁨"]:
-        main_condition = f"황사/이산화황 {air_data['so2_grade']}" # Simplified
+    elif o3_corrected in ["나쁨", "매우나쁨"]:
+        main_condition = f"오존 {o3_corrected}"
         
     # Step B: Query Construction
-    user_condition = user_profile.get("condition", "건강함")
-    age_group = _normalize_age_group(user_profile.get("ageGroup"))
-    
-    # Primary Query: Specific
     search_query = f"{main_condition} 상황에서 {user_condition} {age_group} 행동 요령 주의사항"
     print(f"Generated Search Query (Primary): {search_query}")
 
@@ -436,51 +541,54 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
             "references": []
         }
 
-    # [Logic Update] Calculate Deterministic Decision & Action Items
-    pm25_g = air_data.get("pm25_grade", "보통")
-    o3_g = air_data.get("o3_grade", "보통")
-    
-    decision_key = _calculate_decision(pm25_g, o3_g)
+    # [Logic Update] Calculate Deterministic Decision & Action Items using CORRECTED grades
+    decision_key = _calculate_decision(pm25_corrected, o3_corrected)
     decision_text, action_items = _get_display_content(age_group, decision_key)
     
+    # O3 Special Handling: Force-Append and Warnings
+    is_o3_dominant = GRADE_MAP.get(o3_corrected, 1) >= GRADE_MAP.get(pm25_corrected, 1)
+    if is_o3_dominant and GRADE_MAP.get(o3_corrected, 1) >= 3: # '나쁨' 이상
+        decision_text += " (오존은 마스크로 걸러지지 않아요!)"
+        # Force-Append Action Item
+        o3_force_action = "오후 2~5시 사이에는 실외 활동을 전면 금지하고 실내에 머무르세요."
+        if o3_force_action not in action_items:
+            action_items.append(o3_force_action)
+
+    # Infant Special Warning
+    if age_group == "infant":
+        infant_warning = "※ 주의: 마스크 착용 금지(질식 위험)"
+        if infant_warning not in action_items:
+            action_items.insert(0, infant_warning) # Put at top
+
     # Logic for dual bad condition text append
-    # "둘 다 높은 경우: 더 나쁜 쪽을 따라가되, 문구는 '둘 다 높아요'로 1줄 추가"
-    # -> If reasoning needs this, we can add it to prompt context or just append to decision text if needed.
-    # The requirement says "문구는 '둘 다 높아요'로 1줄 추가". 
-    # Let's append it to decision text if both are >= '나쁨'.
-    p_score = GRADE_MAP.get(pm25_g, 0)
-    o_score = GRADE_MAP.get(o3_g, 0)
-    if p_score >= 2 and o_score >= 2:
+    if GRADE_MAP.get(pm25_corrected, 1) >= 3 and GRADE_MAP.get(o3_corrected, 1) >= 3:
         decision_text += " (미세먼지와 오존 둘 다 높아요!)"
 
     # Prepare Context
     context_text = "\n".join([f"- [출처: {doc.get('source', '가이드라인')}] {doc.get('text', '')}" for doc in relevant_docs]) if relevant_docs else "관련 의학적 가이드라인을 찾을 수 없습니다."
     
     system_prompt = """
-    당신은 환경보건 의사입니다. 대기질 데이터와 환자의 기저질환 정보를 바탕으로 판단 근거(Reason)를 작성해주세요.
+    당신은 환경보건 의사입니다. 대기질 데이터(온도, 습도 포함)와 환자의 기저질환 정보를 바탕으로 판단 근거(Reason)를 작성해주세요.
     
     [중요]
-    1. 'decision'과 'actionItems'는 이미 시스템에서 계산되었습니다. 당신은 이 결정이 내려진 '의학적/환경적 이유(reason)'만 작성하면 됩니다.
-    2. 제공된 [의학적 가이드라인] 내용을 최우선으로 반영하여 설명하세요.
-    3. 반드시 JSON 형식으로 응답해야 합니다.
-    
-    응답 포맷:
-    {
-        "reason": "판단 근거 (가이드라인 내용 인용 포함)"
-    }
+    1. 'decision'과 'actionItems'는 이미 시스템에서 계산되었습니다. 당신은 이 결정이 내려진 '의학적/환경적 이유(reason)'를 작성하세요.
+    2. 보정 로직이 적용된 경우(예: 습도가 너무 높거나 낮아서, 혹은 특정 질환 트리거로 인해 등급이 격상됨) 그 이유를 설명에 포함하세요.
+    3. 제공된 [의학적 가이드라인] 내용을 최우선으로 반영하여 설명하세요.
+    4. 반드시 JSON 형식으로 응답해야 합니다.
     """
     
     user_prompt = f"""
     [상황 정보]
-    - 대기질: PM2.5={pm25_g}, O3={o3_g}
-    - 사용자: {age_group}, {user_condition}
+    - 대기질: 초미세먼지={pm25_raw}(보정후:{pm25_corrected}), 오존={o3_raw}(보정후:{o3_corrected})
+    - 환경: 온도={temp}°C, 습도={humidity}%
+    - 사용자: 연령대={age_group}, 기저질환={user_condition}
     - 시스템 결정: {decision_text}
     - 시스템 행동수칙: {action_items}
     
     [의학적 가이드라인 (참고 문헌)]
     {context_text}
     
-    위 결정이 내려진 배경과 이유를 가이드라인을 참고하여 친절하게 설명해주세요.
+    위 결정이 내려진 배경과 이유를 온도, 습도, 질환 특성을 고려하여 설명해주세요.
     """
     
     try:
