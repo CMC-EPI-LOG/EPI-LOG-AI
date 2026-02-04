@@ -323,6 +323,56 @@ ACTION_ITEMS = {
     }
 }
 
+def _calculate_decision(pm25_grade: str, o3_grade: str) -> str:
+    """
+    Calculate decision level: 'ok', 'caution', 'warning'
+    
+    Logic (1:좋음, 2:보통, 3:나쁨, 4:매우나쁨):
+    • OK: PM2.5 <= 2 AND O3 <= 2
+    • Caution: Either one is 3
+    • Warning: Either one is 4 OR Both are 3
+    """
+    p_score = GRADE_MAP.get(pm25_grade, 2)
+    o_score = GRADE_MAP.get(o3_grade, 2)
+    
+    # Check Warning Conditions
+    if p_score >= 4 or o_score >= 4:
+        return "warning"
+    if p_score == 3 and o_score == 3:
+        return "warning"
+        
+    # Check Caution Conditions
+    if p_score == 3 or o_score == 3:
+        return "caution"
+        
+    # Default OK
+    return "ok"
+
+def _normalize_age_group(age_group: Any) -> str:
+    if age_group is None:
+        return "elementary_high"
+    raw = str(age_group).strip().lower()
+    
+    # Updated 5 groups based on planning document
+    if raw in {"infant", "영아", "0-2", "0~2"}:
+        return "infant"
+    if raw in {"toddler", "유아", "3-6", "3~6"}:
+        return "toddler"
+    if raw in {"elementary_low", "초등저학년", "초등 저학년", "7-9", "7~9", "1-3", "1~3"}:
+        return "elementary_low"
+    if raw in {"elementary_high", "초등고학년", "초등 고학년", "10-12", "10~12", "4-6", "4~6"}:
+        return "elementary_high"
+    if raw in {"teen", "teen_adult", "청소년", "성인", "adult", "13-18", "13~18", "13+"}:
+        return "teen_adult"
+    
+    # Fallbacks
+    if "영아" in raw: return "infant"
+    if "유아" in raw: return "toddler"
+    if "저학년" in raw: return "elementary_low"
+    if "고학년" in raw: return "elementary_high"
+    if "청소년" in raw or "성인" in raw: return "teen_adult"
+    
+    return "elementary_high"
 
 def _get_display_content(age_group: str, condition: str, decision_key: str):
     """
@@ -543,7 +593,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
 
     # [Logic Update] Calculate Deterministic Decision & Action Items using CORRECTED grades
     decision_key = _calculate_decision(pm25_corrected, o3_corrected)
-    decision_text, action_items = _get_display_content(age_group, decision_key)
+    decision_text, action_items = _get_display_content(age_group, user_condition, decision_key)
     
     # O3 Special Handling: Force-Append and Warnings
     is_o3_dominant = GRADE_MAP.get(o3_corrected, 1) >= GRADE_MAP.get(pm25_corrected, 1)
@@ -593,7 +643,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-5-nano",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
