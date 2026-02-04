@@ -7,3 +7,4 @@ openai
 python-dotenv
 pypdf2
 python-multipart
+httpx

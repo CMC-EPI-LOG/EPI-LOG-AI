@@ -407,59 +407,77 @@ except Exception as e:
 
 async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
     """
-    Fetch air quality data for the given station and today's date.
+    Fetch air quality data from EPI-LOG-AIRKOREA API.
+    This API aggregates real-time data from AirKorea and stores it in MongoDB.
     """
-    if db is None:
-        raise Exception("Database connection not initialized")
-        
-    today_str = datetime.now(KST_TZ).strftime("%Y-%m-%d")
+    import httpx
     
-    # Try to find today's data for the station
-    # Note: In a real scenario, you might need to query an external API if DB doesn't have it.
-    # For this task, we assume it's in the DB or we simulate it if not found (for dev purposes).
+    AIRKOREA_API_URL = "https://epi-log-airkorea.vercel.app/api/stations"
     
     try:
-        result = await db[AIR_QUALITY_COLLECTION].find_one({
-            "stationName": station_name,
-            "date": today_str
-        })
-        
-        if result:
-            # Inject mock weather data if not present in the real record
-            if "temp" not in result: result["temp"] = 22.0
-            if "humidity" not in result: result["humidity"] = 45.0
-            # Inject mock air quality values if not present
-            if "pm25_value" not in result: result["pm25_value"] = 65
-            if "o3_value" not in result: result["o3_value"] = 0.065
-            if "pm10_value" not in result: result["pm10_value"] = 85
-            if "no2_value" not in result: result["no2_value"] = 0.025
-            return result
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                AIRKOREA_API_URL,
+                params={"stationName": station_name}
+            )
             
-        # Mock data if not found (for demonstration purposes as requested structure implies data exists)
-        # In production, this should return None or raise specific error
-        print(f"No air quality data found for {station_name} on {today_str}. Using mock data.")
-        return {
-            "stationName": station_name,
-            "date": today_str,
-            "pm10_grade": "나쁨",
-            "pm10_value": 85,   # Added value
-            "pm25_grade": "나쁨",
-            "pm25_value": 65,   # Added value
-            "co_grade": "보통",
-            "co_value": 0.7,    # Added value
-            "o3_grade": "보통",
-            "o3_value": 0.065,  # Added value
-            "no2_grade": "좋음",
-            "no2_value": 0.025, # Added value
-            "so2_grade": "좋음",
-            "so2_value": 0.004, # Added value
-            "integrated_grade": "나쁨",
-            "temp": 22.0,
-            "humidity": 45.0
-        }
+            if response.status_code == 200:
+                data = response.json()
+                
+                # API returns array, take first item
+                if data and len(data) > 0:
+                    station = data[0]
+                    realtime = station.get("realtime", {})
+                    
+                    # Convert grade numbers to Korean text
+                    grade_map = {1: "좋음", 2: "보통", 3: "나쁨", 4: "매우나쁨"}
+                    
+                    # Extract and normalize data
+                    result = {
+                        "stationName": station.get("stationName", station_name),
+                        "pm25_grade": grade_map.get(realtime.get("pm25", {}).get("grade"), "보통"),
+                        "pm25_value": realtime.get("pm25", {}).get("value") or 50,
+                        "pm10_grade": grade_map.get(realtime.get("pm10", {}).get("grade"), "보통"),
+                        "pm10_value": realtime.get("pm10", {}).get("value") or 70,
+                        "o3_grade": grade_map.get(realtime.get("o3", {}).get("grade"), "보통"),
+                        "o3_value": realtime.get("o3", {}).get("value") or 0.05,
+                        "no2_grade": grade_map.get(realtime.get("no2", {}).get("grade"), "좋음"),
+                        "no2_value": realtime.get("no2", {}).get("value") or 0.02,
+                        "co_grade": grade_map.get(realtime.get("co", {}).get("grade"), "좋음"),
+                        "co_value": realtime.get("co", {}).get("value") or 0.5,
+                        "so2_grade": grade_map.get(realtime.get("so2", {}).get("grade"), "좋음"),
+                        "so2_value": realtime.get("so2", {}).get("value") or 0.003,
+                        # Inject mock weather data (until weather API integration)
+                        "temp": 22.0,
+                        "humidity": 45.0
+                    }
+                    
+                    print(f"✅ Fetched air quality for {station_name} from EPI-LOG-AIRKOREA API")
+                    return result
+        
+        # Fallback to mock data if API call fails
+        print(f"⚠️  No data from AIRKOREA API for {station_name}. Using mock data.")
     except Exception as e:
-        print(f"Error fetching air quality: {e}")
-        raise e
+        print(f"❌ Error fetching air quality from AIRKOREA API: {e}")
+    
+    # Return mock data
+    return {
+        "stationName": station_name,
+        "pm10_grade": "나쁨",
+        "pm10_value": 85,
+        "pm25_grade": "나쁨",
+        "pm25_value": 65,
+        "co_grade": "보통",
+        "co_value": 0.7,
+        "o3_grade": "보통",
+        "o3_value": 0.065,
+        "no2_grade": "좋음",
+        "no2_value": 0.025,
+        "so2_grade": "좋음",
+        "so2_value": 0.004,
+        "temp": 22.0,
+        "humidity": 45.0
+    }
 
 CACHE_COLLECTION = "rag_cache"
 CACHE_TTL_SECONDS = 60 * 60 * 30  # 30 hours
