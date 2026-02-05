@@ -171,3 +171,4 @@ sequenceDiagram
 pip install -r requirements.txt
 uvicorn main:app --reload
 ```
+# Updated: Thu Feb  5 22:11:20 KST 2026
