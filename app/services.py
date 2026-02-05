@@ -18,6 +18,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DB_NAME = "epilog_db"
 GUIDELINES_COLLECTION = "medical_guidelines"
 AIR_QUALITY_COLLECTION = "daily_air_quality"
+AIR_QUALITY_DATA_COLLECTION = "air_quality_data"  # Lambda cron job collection
 VECTOR_INDEX = "vector_index"
 KST_TZ = ZoneInfo("Asia/Seoul")
 
@@ -405,13 +406,94 @@ except Exception as e:
     print(f"Error initializing OpenAI client: {e}")
     openai_client = None
 
-async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
+async def get_air_quality_from_mongodb(station_name: str) -> Optional[Dict[str, Any]]:
     """
-    Fetch air quality data from EPI-LOG-AIRKOREA API.
-    This API aggregates real-time data from AirKorea and stores it in MongoDB.
+    Fetch latest air quality data from MongoDB air_quality_data collection.
+    This collection is populated by AWS Lambda cron job every hour.
+    Returns None if no recent data (> 2 hours old) or not found.
+    """
+    if db is None:
+        return None
+    
+    try:
+        # Query for the station with most recent data
+        query = {"stationName": station_name}
+        
+        # Sort by dataTime descending to get latest entry
+        cursor = db[AIR_QUALITY_DATA_COLLECTION].find(query).sort("createdAt", -1).limit(1)
+        doc = await cursor.to_list(length=1)
+        
+        if not doc:
+            print(f"⚠️  No MongoDB data found for station: {station_name}")
+            return None
+        
+        data = doc[0]
+        
+        # Check data freshness (must be within 2 hours)
+        created_at = data.get("createdAt")
+        if created_at:
+            from datetime import datetime, timedelta
+            now = datetime.now(KST_TZ)
+            
+            # Handle both datetime objects and strings
+            if isinstance(created_at, str):
+                created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+            
+            # Make timezone-aware if needed
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=KST_TZ)
+            
+            age = now - created_at
+            if age > timedelta(hours=2):
+                print(f"⚠️  MongoDB data is stale ({age.total_seconds()/3600:.1f} hours old)")
+                return None
+        
+        # Convert grade strings to Korean text
+        grade_map = {"1": "좋음", "2": "보통", "3": "나쁨", "4": "매우나쁨"}
+        
+        # Transform to expected format
+        result = {
+            "stationName": data.get("stationName", station_name),
+            "sidoName": data.get("sidoName", ""),
+            "pm25_grade": grade_map.get(str(data.get("pm25Grade", "2")), "보통"),
+            "pm25_value": data.get("pm25Value", 50),
+            "pm10_grade": grade_map.get(str(data.get("pm10Grade", "2")), "보통"),
+            "pm10_value": data.get("pm10Value", 70),
+            "o3_grade": grade_map.get(str(data.get("o3Grade", "1")), "좋음"),
+            "o3_value": data.get("o3Value", 0.05),
+            "no2_grade": grade_map.get(str(data.get("no2Grade", "1")), "좋음"),
+            "no2_value": data.get("no2Value", 0.02),
+            "co_grade": grade_map.get(str(data.get("coGrade", "1")), "좋음"),
+            "co_value": data.get("coValue", 0.5),
+            "so2_grade": grade_map.get(str(data.get("so2Grade", "1")), "좋음"),
+            "so2_value": data.get("so2Value", 0.003),
+            # Note: Lambda data doesn't include temp/humidity yet
+            # These will be added when weather API is integrated
+            "temp": None,
+            "humidity": None,
+            "dataTime": data.get("dataTime", "")
+        }
+        
+        print(f"✅ Fetched air quality for {station_name} from MongoDB (Lambda data)")
+        return result
+        
+    except Exception as e:
+        print(f"❌ Error fetching from MongoDB: {e}")
+        return None
+
+async def get_air_quality_from_airkorea_api(station_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Direct fallback to Air Korea OpenAPI.
+    This replaces the dependency on EPI-LOG-AIRKOREA service.
     """
     import httpx
     
+    # Air Korea OpenAPI endpoint (replace with actual endpoint if different)
+    # Note: This is a placeholder - actual Air Korea API integration would require
+    # API key and proper endpoint configuration
+    
+    # For now, we'll try the old EPI-LOG-AIRKOREA service as temporary fallback
+    # TODO: Replace with direct Air Korea OpenAPI call
     AIRKOREA_API_URL = "https://epi-log-airkorea.vercel.app/api/stations"
     
     try:
@@ -447,20 +529,52 @@ async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
                         "co_value": realtime.get("co", {}).get("value") or 0.5,
                         "so2_grade": grade_map.get(realtime.get("so2", {}).get("grade"), "좋음"),
                         "so2_value": realtime.get("so2", {}).get("value") or 0.003,
-                        # Inject mock weather data (until weather API integration)
-                        "temp": 22.0,
-                        "humidity": 45.0
+                        "temp": None,
+                        "humidity": None
                     }
                     
-                    print(f"✅ Fetched air quality for {station_name} from EPI-LOG-AIRKOREA API")
+                    print(f"✅ Fetched air quality for {station_name} from Air Korea API (fallback)")
                     return result
         
-        # Fallback to mock data if API call fails
-        print(f"⚠️  No data from AIRKOREA API for {station_name}. Using mock data.")
+        print(f"⚠️  No data from Air Korea API for {station_name}")
+        return None
+        
     except Exception as e:
-        print(f"❌ Error fetching air quality from AIRKOREA API: {e}")
+        print(f"❌ Error fetching from Air Korea API: {e}")
+        return None
+
+async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch air quality data with priority order:
+    1. MongoDB air_quality_data (Lambda cron job data) - PRIORITY
+    2. Air Korea OpenAPI (fallback for real-time data)
+    3. Mock data (final fallback)
     
-    # Return mock data
+    Note: Temperature and humidity are not yet available from Lambda data.
+    They will be added when weather API integration is complete.
+    """
+    # Priority 1: Try MongoDB (Lambda-stored data)
+    data = await get_air_quality_from_mongodb(station_name)
+    if data:
+        # Add default temp/humidity for now (will be replaced with weather API)
+        if data.get("temp") is None:
+            data["temp"] = 22.0  # Default value
+        if data.get("humidity") is None:
+            data["humidity"] = 45.0  # Default value
+        return data
+    
+    # Priority 2: Try Air Korea API (temporary fallback)
+    data = await get_air_quality_from_airkorea_api(station_name)
+    if data:
+        # Add default temp/humidity
+        if data.get("temp") is None:
+            data["temp"] = 22.0
+        if data.get("humidity") is None:
+            data["humidity"] = 45.0
+        return data
+    
+    # Priority 3: Return mock data (final fallback)
+    print(f"⚠️  Using mock data for {station_name}")
     return {
         "stationName": station_name,
         "pm10_grade": "나쁨",

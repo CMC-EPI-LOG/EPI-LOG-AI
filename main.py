@@ -56,6 +56,36 @@ async def give_advice(request: AdviceRequest):
             }
         )
 
+@app.get("/api/air-quality")
+async def get_air_quality_endpoint(stationName: str):
+    """
+    Public endpoint for air quality data retrieval.
+    Replaces EPI-LOG-AIRKOREA /api/stations endpoint.
+    
+    Query Parameters:
+    - stationName: Name of the monitoring station (e.g., "종로구", "신풍동")
+    
+    Returns:
+    - Air quality data including PM2.5, PM10, O3, and other pollutants
+    """
+    from app.services import get_air_quality
+    
+    try:
+        data = await get_air_quality(stationName)
+        if not data:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"No data found for station: {stationName}"}
+            )
+        
+        return JSONResponse(content=data)
+    except Exception as e:
+        print(f"Error fetching air quality: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Internal Server Error", "details": str(e)}
+        )
+
 from fastapi import UploadFile, File
 
 @app.post("/api/ingest/pdf")
