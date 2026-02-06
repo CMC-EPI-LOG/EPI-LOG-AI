@@ -16,7 +16,8 @@ class AdviceRequest(BaseModel):
 # Define Response Model
 class AdviceResponse(BaseModel):
     decision: str
-    reason: str
+    three_reason: List[str]  # 3 bullet points with **keyword** highlighting
+    detail_answer: str       # Detailed medical explanation
     actionItems: List[str]
     references: List[str]
 
@@ -49,7 +50,8 @@ async def give_advice(request: AdviceRequest):
             status_code=500,
             content={
                 "decision": "Error",
-                "reason": "Internal Server Error",
+                "three_reason": ["시스템 오류가 발생했습니다.", "잠시 후 다시 시도해주세요.", "문제가 지속되면 관리자에게 문의하세요."],
+                "detail_answer": "Internal Server Error",
                 "details": str(e),
                 "actionItems": [],
                 "references": []

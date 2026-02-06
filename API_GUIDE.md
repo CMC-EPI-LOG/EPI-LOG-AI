@@ -48,7 +48,12 @@ curl -X POST "https://<your-domain>/api/advice" \
 ```json
 {
   "decision": "오늘은 실내가 더 편해요 🏠",
-  "reason": "현재 미세먼지 농도가 나쁨 수준이며, 천식 환자에게는 위험할 수 있습니다.",
+  "three_reason": [
+    "현재 미세먼지가 **나쁨** 수준이라 호흡기가 예민할 수 있어요.",
+    "특히 **천식**이 있다면 기도가 수축될 위험이 높습니다.",
+    "오늘은 **실외 활동**을 자제하고 마스크를 꼭 챙겨주세요."
+  ],
+  "detail_answer": "현재 미세먼지 농도가 나쁨 수준이며, 천식 환자에게는 위험할 수 있습니다. 온도와 습도를 고려할 때 기도가 더욱 민감해질 수 있으므로, 실외 활동을 최소화하고 실내에서 안전하게 지내는 것이 좋습니다.",
   "actionItems": [
     "외출 대신 장난감 정리+찾기 게임",
     "실내에서 풍선배구/장애물 코스(가볍게)",
@@ -60,6 +65,13 @@ curl -X POST "https://<your-domain>/api/advice" \
   ]
 }
 ```
+
+**Response Fields:**
+- `decision` (String): Short decision text from the system
+- `three_reason` (Array[String]): 3 concise summary points with `**keyword**` markers for frontend highlighting
+- `detail_answer` (String): Detailed medical explanation
+- `actionItems` (Array[String]): Recommended action items
+- `references` (Array[String]): Source references from medical guidelines
 
 ---
 

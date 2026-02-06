@@ -729,7 +729,12 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     if not openai_client:
          return {
             "decision": "Error",
-            "reason": "OpenAI Client not initialized",
+            "three_reason": [
+                "**AI 시스템**이 초기화되지 않았습니다.",
+                "서버 설정을 확인해주세요.",
+                "**관리자**에게 문의하세요."
+            ],
+            "detail_answer": "OpenAI Client not initialized",
             "actionItems": [],
             "references": []
         }
@@ -761,13 +766,25 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     context_text = "\n".join([f"- [출처: {doc.get('source', '가이드라인')}] {doc.get('text', '')}" for doc in relevant_docs]) if relevant_docs else "관련 의학적 가이드라인을 찾을 수 없습니다."
     
     system_prompt = """
-    당신은 환경보건 의사입니다. 대기질 데이터(온도, 습도 포함)와 환자의 기저질환 정보를 바탕으로 판단 근거(Reason)를 작성해주세요.
+    너는 복잡한 대기질 논문과 데이터를 학부모가 이해하기 쉽게 설명해주는 AI 비서다.
     
-    [중요]
-    1. 'decision'과 'actionItems'는 이미 시스템에서 계산되었습니다. 당신은 이 결정이 내려진 '의학적/환경적 이유(reason)'를 작성하세요.
-    2. 보정 로직이 적용된 경우(예: 습도가 너무 높거나 낮아서, 혹은 특정 질환 트리거로 인해 등급이 격상됨) 그 이유를 설명에 포함하세요.
-    3. 제공된 [의학적 가이드라인] 내용을 최우선으로 반영하여 설명하세요.
-    4. 반드시 JSON 형식으로 응답해야 합니다.
+    [역할 및 출력 제약]
+    1. 'decision'과 'actionItems'는 이미 시스템에서 계산되었습니다. 당신은 이 결정이 내려진 이유를 학부모가 이해하기 쉽게 설명해야 합니다.
+    2. 반드시 다음 두 가지를 JSON 형식으로 출력하세요:
+       - "three_reason": 정확히 3개의 짧은 요약 문장 배열 (각 문장은 한 줄로, 핵심 키워드는 **double asterisks**로 감싸기)
+       - "detail_answer": 상세한 의학적/환경적 설명 (기존의 긴 설명)
+    
+    3. **키워드 하이라이팅 규칙**:
+       - 질환명 (예: **천식**, **비염**, **아토피**)
+       - 대기질 등급 (예: **좋음**, **나쁨**, **매우나쁨**)
+       - 행동 요령 (예: **실외 활동**, **마스크 착용**, **환기**)
+       - 중요한 수치나 시간대 (예: **35**, **오후 2~5시**)
+    
+    4. **톤앤매너**: 친절하지만 명확하고 단호하게. 학부모가 즉시 행동할 수 있도록 구체적으로 작성하세요.
+    
+    5. 보정 로직이 적용된 경우(예: 습도, 온도로 인한 등급 격상) 그 이유를 three_reason이나 detail_answer에 포함하세요.
+    
+    6. 제공된 [의학적 가이드라인] 내용을 최우선으로 반영하여 설명하세요.
     """
     
     user_prompt = f"""
@@ -781,7 +798,17 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     [의학적 가이드라인 (참고 문헌)]
     {context_text}
     
-    위 결정이 내려진 배경과 이유를 온도, 습도, 질환 특성을 고려하여 설명해주세요.
+    위 결정이 내려진 배경과 이유를 학부모가 이해하기 쉽게 설명해주세요.
+    
+    출력 형식 (JSON):
+    {{
+      "three_reason": [
+        "첫 번째 요약 문장 (핵심 키워드는 **이렇게** 감싸기)",
+        "두 번째 요약 문장",
+        "세 번째 요약 문장"
+      ],
+      "detail_answer": "상세한 의학적 설명..."
+    }}
     """
     
     try:
@@ -801,7 +828,12 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         # Merge Results
         final_result = {
             "decision": decision_text,
-            "reason": llm_result.get("reason", "정보를 불러오는 중 문제가 발생했습니다."),
+            "three_reason": llm_result.get("three_reason", [
+                "대기질 정보를 분석하고 있습니다.",
+                "잠시 후 다시 확인해주세요.",
+                "문제가 지속되면 관리자에게 문의하세요."
+            ]),
+            "detail_answer": llm_result.get("detail_answer", "정보를 불러오는 중 문제가 발생했습니다."),
             "actionItems": action_items,
             "references": list(set([doc.get("source", "Unknown Source") for doc in relevant_docs])),
             # Add real-time air quality values for frontend display
@@ -830,7 +862,12 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         # Fallback even if LLM fails, we satisfy the deterministic requirement
         return {
             "decision": decision_text,
-            "reason": "일시적인 오류로 상세 설명을 불러오지 못했습니다. 하지만 행동 지침은 위와 같이 준수해주세요.",
+            "three_reason": [
+                "일시적인 오류로 상세 분석을 불러오지 못했습니다.",
+                "하지만 **행동 지침**은 위와 같이 준수해주세요.",
+                "문제가 지속되면 **관리자**에게 문의하세요."
+            ],
+            "detail_answer": "일시적인 오류로 상세 설명을 불러오지 못했습니다. 하지만 행동 지침은 위와 같이 준수해주세요.",
             "actionItems": action_items,
             "references": [],
             # Add real-time air quality values for frontend display
