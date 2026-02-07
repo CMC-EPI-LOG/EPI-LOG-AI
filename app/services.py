@@ -1,8 +1,9 @@
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional, Any
+from urllib.parse import urlparse
 import voyageai
 from openai import OpenAI
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -15,7 +16,22 @@ load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI") or os.getenv("MONGODB_URI")
 VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DB_NAME = "epilog_db"
+
+
+def _infer_db_name_from_uri(uri: Optional[str]) -> Optional[str]:
+    if not uri:
+        return None
+    try:
+        parsed = urlparse(uri)
+        # mongodb+srv://host/<db>?...
+        db_name = parsed.path.lstrip("/").split("?")[0].strip()
+        return db_name or None
+    except Exception:
+        return None
+
+
+DB_NAME = os.getenv("MONGO_DB_NAME", "epilog_db")
+AIR_QUALITY_DB_NAME = os.getenv("AIR_QUALITY_DB_NAME") or _infer_db_name_from_uri(MONGO_URI) or DB_NAME
 GUIDELINES_COLLECTION = "medical_guidelines"
 AIR_QUALITY_COLLECTION = "daily_air_quality"
 AIR_QUALITY_DATA_COLLECTION = "air_quality_data"  # Lambda cron job collection
@@ -31,10 +47,13 @@ if not MONGO_URI:
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URI)
     db = mongo_client[DB_NAME]
+    air_quality_db = mongo_client[AIR_QUALITY_DB_NAME]
+    print(f"✅ MongoDB connected: main_db={DB_NAME}, air_quality_db={AIR_QUALITY_DB_NAME}")
 except Exception as e:
     print(f"Error initializing MongoDB client: {e}")
     mongo_client = None
     db = None
+    air_quality_db = None
 
 # --- Logic Constants ---
 GRADE_MAP = {
@@ -95,6 +114,66 @@ def _get_corrected_grade(
     # (Simplified: if score * w_h rounds up to next grade)
     final_score = min(4, max(1, round(score * w_h)))
     return REVERSE_GRADE_MAP.get(final_score, base_grade)
+
+
+def _normalize_station_candidates(station_name: str) -> List[str]:
+    cleaned = " ".join((station_name or "").strip().split())
+    if not cleaned:
+        return []
+
+    seen = set()
+    candidates: List[str] = []
+
+    def add(value: str):
+        normalized = " ".join(value.strip().split())
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        candidates.append(normalized)
+
+    add(cleaned)
+    add(cleaned.replace(" ", ""))
+
+    tokens = cleaned.split(" ")
+    if len(tokens) >= 2:
+        add(tokens[-1])
+        add(tokens[-2])
+        add(f"{tokens[-2]} {tokens[-1]}")
+    elif tokens:
+        add(tokens[0])
+
+    return candidates
+
+
+def _parse_datetime_to_kst(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+
+    dt: Optional[datetime] = None
+
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+
+        # AirKorea Lambda snapshot format: "YYYY-MM-DD HH:MM"
+        try:
+            parsed = datetime.strptime(text, "%Y-%m-%d %H:%M")
+            dt = parsed.replace(tzinfo=KST_TZ)
+        except ValueError:
+            try:
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+    else:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=KST_TZ)
+
+    return dt.astimezone(KST_TZ)
 
 # Decision Texts based on logic.csv (80-segment dataset)
 DECISION_TEXTS = {
@@ -412,71 +491,87 @@ async def get_air_quality_from_mongodb(station_name: str) -> Optional[Dict[str, 
     This collection is populated by AWS Lambda cron job every hour.
     Returns None if no recent data (> 2 hours old) or not found.
     """
-    if db is None:
+    if air_quality_db is None:
         return None
     
     try:
-        # Query for the station with most recent data
-        query = {"stationName": station_name}
-        
-        # Sort by dataTime descending to get latest entry
-        cursor = db[AIR_QUALITY_DATA_COLLECTION].find(query).sort("createdAt", -1).limit(1)
-        doc = await cursor.to_list(length=1)
-        
-        if not doc:
-            print(f"⚠️  No MongoDB data found for station: {station_name}")
+        station_candidates = _normalize_station_candidates(station_name)
+        if not station_candidates:
             return None
-        
-        data = doc[0]
-        
+
+        # Latest-first sort strategy:
+        # 1) dataTime (AirKorea snapshot time), 2) updatedAt (ingest time), 3) _id (insert order)
+        sort_criteria = [("dataTime", -1), ("updatedAt", -1), ("_id", -1)]
+        data = None
+        matched_candidate = None
+
+        for candidate in station_candidates:
+            data = await air_quality_db[AIR_QUALITY_DATA_COLLECTION].find_one(
+                {"stationName": candidate},
+                sort=sort_criteria
+            )
+            if data:
+                matched_candidate = candidate
+                break
+
+        if not data:
+            print(f"⚠️  No MongoDB data found for station candidates: {station_candidates}")
+            return None
+
         # Check data freshness (must be within 2 hours)
-        created_at = data.get("createdAt")
-        if created_at:
-            from datetime import datetime, timedelta
+        observed_at = (
+            _parse_datetime_to_kst(data.get("dataTime"))
+            or _parse_datetime_to_kst(data.get("updatedAt"))
+            or _parse_datetime_to_kst(data.get("createdAt"))
+        )
+        if observed_at:
             now = datetime.now(KST_TZ)
-            
-            # Handle both datetime objects and strings
-            if isinstance(created_at, str):
-                created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-            
-            # Make timezone-aware if needed
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=KST_TZ)
-            
-            age = now - created_at
+            age = now - observed_at
             if age > timedelta(hours=2):
-                print(f"⚠️  MongoDB data is stale ({age.total_seconds()/3600:.1f} hours old)")
+                print(
+                    f"⚠️  MongoDB data is stale ({age.total_seconds()/3600:.1f} hours old), "
+                    f"station={data.get('stationName')} observed_at={observed_at.isoformat()}"
+                )
                 return None
-        
+
         # Convert grade strings to Korean text
         grade_map = {"1": "좋음", "2": "보통", "3": "나쁨", "4": "매우나쁨"}
-        
-        # Transform to expected format
+
+        # Support both camelCase (Lambda docs) and snake_case (legacy docs)
+        pm25_grade_value = data.get("pm25Grade", data.get("pm25_grade", "2"))
+        pm10_grade_value = data.get("pm10Grade", data.get("pm10_grade", "2"))
+        o3_grade_value = data.get("o3Grade", data.get("o3_grade", "1"))
+        no2_grade_value = data.get("no2Grade", data.get("no2_grade", "1"))
+        co_grade_value = data.get("coGrade", data.get("co_grade", "1"))
+        so2_grade_value = data.get("so2Grade", data.get("so2_grade", "1"))
+
         result = {
             "stationName": data.get("stationName", station_name),
-            "sidoName": data.get("sidoName", ""),
-            "pm25_grade": grade_map.get(str(data.get("pm25Grade", "2")), "보통"),
-            "pm25_value": data.get("pm25Value", 50),
-            "pm10_grade": grade_map.get(str(data.get("pm10Grade", "2")), "보통"),
-            "pm10_value": data.get("pm10Value", 70),
-            "o3_grade": grade_map.get(str(data.get("o3Grade", "1")), "좋음"),
-            "o3_value": data.get("o3Value", 0.05),
-            "no2_grade": grade_map.get(str(data.get("no2Grade", "1")), "좋음"),
-            "no2_value": data.get("no2Value", 0.02),
-            "co_grade": grade_map.get(str(data.get("coGrade", "1")), "좋음"),
-            "co_value": data.get("coValue", 0.5),
-            "so2_grade": grade_map.get(str(data.get("so2Grade", "1")), "좋음"),
-            "so2_value": data.get("so2Value", 0.003),
+            "sidoName": data.get("sidoName"),
+            "pm25_grade": grade_map.get(str(pm25_grade_value), "보통"),
+            "pm25_value": data.get("pm25Value", data.get("pm25_value", 50)),
+            "pm10_grade": grade_map.get(str(pm10_grade_value), "보통"),
+            "pm10_value": data.get("pm10Value", data.get("pm10_value", 70)),
+            "o3_grade": grade_map.get(str(o3_grade_value), "좋음"),
+            "o3_value": data.get("o3Value", data.get("o3_value", 0.05)),
+            "no2_grade": grade_map.get(str(no2_grade_value), "좋음"),
+            "no2_value": data.get("no2Value", data.get("no2_value", 0.02)),
+            "co_grade": grade_map.get(str(co_grade_value), "좋음"),
+            "co_value": data.get("coValue", data.get("co_value", 0.5)),
+            "so2_grade": grade_map.get(str(so2_grade_value), "좋음"),
+            "so2_value": data.get("so2Value", data.get("so2_value", 0.003)),
             # Note: Lambda data doesn't include temp/humidity yet
-            # These will be added when weather API is integrated
             "temp": None,
             "humidity": None,
-            "dataTime": data.get("dataTime", "")
+            "dataTime": data.get("dataTime"),
         }
-        
-        print(f"✅ Fetched air quality for {station_name} from MongoDB (Lambda data)")
+
+        print(
+            f"✅ Fetched latest air quality from MongoDB "
+            f"(requested={station_name}, matched={matched_candidate}, station={result['stationName']}, dataTime={result.get('dataTime')})"
+        )
         return result
-        
+
     except Exception as e:
         print(f"❌ Error fetching from MongoDB: {e}")
         return None
@@ -517,6 +612,7 @@ async def get_air_quality_from_airkorea_api(station_name: str) -> Optional[Dict[
                     # Extract and normalize data
                     result = {
                         "stationName": station.get("stationName", station_name),
+                        "sidoName": station.get("sidoName"),
                         "pm25_grade": grade_map.get(realtime.get("pm25", {}).get("grade"), "보통"),
                         "pm25_value": realtime.get("pm25", {}).get("value") or 50,
                         "pm10_grade": grade_map.get(realtime.get("pm10", {}).get("grade"), "보통"),
@@ -530,7 +626,8 @@ async def get_air_quality_from_airkorea_api(station_name: str) -> Optional[Dict[
                         "so2_grade": grade_map.get(realtime.get("so2", {}).get("grade"), "좋음"),
                         "so2_value": realtime.get("so2", {}).get("value") or 0.003,
                         "temp": None,
-                        "humidity": None
+                        "humidity": None,
+                        "dataTime": realtime.get("dataTime") or station.get("dataTime")
                     }
                     
                     print(f"✅ Fetched air quality for {station_name} from Air Korea API (fallback)")
@@ -576,6 +673,7 @@ async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
     # Priority 3: Return mock data (final fallback)
     print(f"⚠️  Using mock data for {station_name}")
     return {
+        "sidoName": None,
         "stationName": station_name,
         "pm10_grade": "나쁨",
         "pm10_value": 85,
@@ -590,12 +688,31 @@ async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
         "so2_grade": "좋음",
         "so2_value": 0.004,
         "temp": 22.0,
-        "humidity": 45.0
+        "humidity": 45.0,
+        "dataTime": None,
     }
 
 CACHE_COLLECTION = "rag_cache"
 CACHE_TTL_SECONDS = 60 * 60 * 30  # 30 hours
 _cache_ttl_index_ready = False
+
+def _normalize_cache_token(value: Any) -> str:
+    if value is None:
+        return "na"
+    token = str(value).strip()
+    if not token:
+        return "na"
+    for old, new in [
+        (" ", ""),
+        (":", "-"),
+        ("/", "-"),
+        ("\\", "-"),
+        ("\n", ""),
+        ("\t", "")
+    ]:
+        token = token.replace(old, new)
+    return token or "na"
+
 
 def _generate_cache_key(air_data: Dict[str, Any], user_profile: Dict[str, Any]) -> str:
     grade_map = {"좋음": 1, "보통": 2, "나쁨": 3, "매우나쁨": 4}
@@ -606,10 +723,29 @@ def _generate_cache_key(air_data: Dict[str, Any], user_profile: Dict[str, Any]) 
     
     age_group = _normalize_age_group(user_profile.get("ageGroup"))
     condition = user_profile.get("condition", "unknown")
-    date_key = air_data.get("date") or datetime.now(KST_TZ).strftime("%Y-%m-%d")
+    station_key = _normalize_cache_token(
+        f"{air_data.get('sidoName', '')}_{air_data.get('stationName', '')}"
+    )
+
+    observed_at = (
+        _parse_datetime_to_kst(air_data.get("dataTime"))
+        or _parse_datetime_to_kst(air_data.get("updatedAt"))
+    )
+    observed_key = observed_at.strftime("%Y%m%d%H%M") if observed_at else datetime.now(KST_TZ).strftime("%Y%m%d")
+
+    pm25_value = _normalize_cache_token(air_data.get("pm25_value"))
+    pm10_value = _normalize_cache_token(air_data.get("pm10_value"))
+    o3_value = _normalize_cache_token(air_data.get("o3_value"))
+    no2_value = _normalize_cache_token(air_data.get("no2_value"))
     
-    # Key format: pm25:3_pm10:2_o3:1_age:adult_cond:asthma_date:2026-01-28
-    return f"pm25:{pm25}_pm10:{pm10}_o3:{o3}_age:{age_group}_cond:{condition}_date:{date_key}"
+    # Key format:
+    # station:seoul_jongro_pm25:2_pm10:2_o3:1_age:toddler_cond:asthma_obs:202602071300_vals:14_52_0.03_0.009
+    return (
+        f"station:{station_key}_"
+        f"pm25:{pm25}_pm10:{pm10}_o3:{o3}_"
+        f"age:{_normalize_cache_token(age_group)}_cond:{_normalize_cache_token(condition)}_"
+        f"obs:{observed_key}_vals:{pm25_value}_{pm10_value}_{o3_value}_{no2_value}"
+    )
 
 async def _ensure_cache_ttl_index():
     global _cache_ttl_index_ready
@@ -653,8 +789,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     if db is not None:
         try:
             await _ensure_cache_ttl_index()
-            # Simple key extension: add T/H to capture environmental context
-            cache_key = _generate_cache_key(air_data, user_profile) + f"_T:{temp}_H:{humidity}"
+            cache_key = _generate_cache_key(air_data, user_profile)
             cached_entry = await db[CACHE_COLLECTION].find_one({"_id": cache_key})
             
             if cached_entry:
