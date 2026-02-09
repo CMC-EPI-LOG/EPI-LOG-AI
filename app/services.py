@@ -545,6 +545,28 @@ async def get_air_quality_from_mongodb(station_name: str) -> Optional[Dict[str, 
         co_grade_value = data.get("coGrade", data.get("co_grade", "1"))
         so2_grade_value = data.get("so2Grade", data.get("so2_grade", "1"))
 
+        def _coerce_number(value: Any) -> Optional[float]:
+            if value is None:
+                return None
+            # Decimal128 in Mongo can break JSON serialization; normalize to float when possible.
+            try:
+                if hasattr(value, "to_decimal"):
+                    return float(value.to_decimal())
+            except Exception:
+                pass
+            try:
+                return float(value)
+            except Exception:
+                return None
+
+        temp_raw = data.get("temperature")
+        if temp_raw is None:
+            temp_raw = data.get("temp")
+        humidity_raw = data.get("humidity")
+
+        temp_value = _coerce_number(temp_raw)
+        humidity_value = _coerce_number(humidity_raw)
+
         result = {
             "stationName": data.get("stationName", station_name),
             "sidoName": data.get("sidoName"),
@@ -560,9 +582,10 @@ async def get_air_quality_from_mongodb(station_name: str) -> Optional[Dict[str, 
             "co_value": data.get("coValue", data.get("co_value", 0.5)),
             "so2_grade": grade_map.get(str(so2_grade_value), "좋음"),
             "so2_value": data.get("so2Value", data.get("so2_value", 0.003)),
-            # Note: Lambda data doesn't include temp/humidity yet
-            "temp": None,
-            "humidity": None,
+            # Lambda now stores weather on the same document.
+            # Support both `temperature` (Lambda) and `temp` (legacy/other sources).
+            "temp": temp_value,
+            "humidity": humidity_value,
             "dataTime": data.get("dataTime"),
         }
 
@@ -647,8 +670,8 @@ async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
     2. Air Korea OpenAPI (fallback for real-time data)
     3. Mock data (final fallback)
     
-    Note: Temperature and humidity are not yet available from Lambda data.
-    They will be added when weather API integration is complete.
+    Note: Temperature and humidity are expected to be present in the Lambda-stored MongoDB document.
+    If missing, the API returns default placeholders.
     """
     # Priority 1: Try MongoDB (Lambda-stored data)
     data = await get_air_quality_from_mongodb(station_name)
