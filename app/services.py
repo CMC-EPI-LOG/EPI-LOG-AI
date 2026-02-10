@@ -131,18 +131,202 @@ def _normalize_station_candidates(station_name: str) -> List[str]:
         seen.add(normalized)
         candidates.append(normalized)
 
+    def add_dong_number_variant(token: str):
+        """
+        Expand Korean dong names like '대저1동' -> '대저동'.
+        This helps when station metadata omits the numeric suffix.
+        """
+        if not token:
+            return
+        import re
+        m = re.match(r"^(.+?)([0-9]+)동$", token)
+        if not m:
+            return
+        base = (m.group(1) or "").strip()
+        if base:
+            add(f"{base}동")
+
     add(cleaned)
     add(cleaned.replace(" ", ""))
 
     tokens = cleaned.split(" ")
     if len(tokens) >= 2:
         add(tokens[-1])
+        add_dong_number_variant(tokens[-1])
         add(tokens[-2])
         add(f"{tokens[-2]} {tokens[-1]}")
+        # Also try numeric-dong normalized pair, e.g. '강서구 대저동'
+        import re
+        if re.match(r"^[0-9]+동$", tokens[-1]):
+            # e.g. '대저 1동' -> '대저1동'
+            combined = f"{tokens[-2]}{tokens[-1]}"
+            add(combined)
+            add_dong_number_variant(combined)
+        m = re.match(r"^(.+?)([0-9]+)동$", tokens[-1])
+        if m and m.group(1):
+            add(f"{tokens[-2]} {m.group(1)}동")
     elif tokens:
         add(tokens[0])
 
     return candidates
+
+
+_SIDO_ALIASES = {
+    # Special cities
+    "서울": "서울",
+    "서울특별시": "서울",
+    "부산": "부산",
+    "부산광역시": "부산",
+    "대구": "대구",
+    "대구광역시": "대구",
+    "인천": "인천",
+    "인천광역시": "인천",
+    "광주": "광주",
+    "광주광역시": "광주",
+    "대전": "대전",
+    "대전광역시": "대전",
+    "울산": "울산",
+    "울산광역시": "울산",
+    "세종": "세종",
+    "세종특별자치시": "세종",
+    # Provinces
+    "경기": "경기",
+    "경기도": "경기",
+    "강원": "강원",
+    "강원도": "강원",
+    "충북": "충북",
+    "충청북도": "충북",
+    "충남": "충남",
+    "충청남도": "충남",
+    "전북": "전북",
+    "전라북도": "전북",
+    "전남": "전남",
+    "전라남도": "전남",
+    "경북": "경북",
+    "경상북도": "경북",
+    "경남": "경남",
+    "경상남도": "경남",
+    "제주": "제주",
+    "제주특별자치도": "제주",
+}
+
+
+def _infer_preferred_sido_from_text(text: str) -> Optional[str]:
+    """
+    Infer a preferred `sidoName` (city/province) from a user-provided station/address string.
+    Example: '부산 강서구 대저1동' -> '부산'
+    """
+    if not text:
+        return None
+    cleaned = " ".join(str(text).strip().split())
+    if not cleaned:
+        return None
+
+    # Prefer prefix token (most common form: '<sido> <sigungu> ...')
+    tokens = cleaned.split(" ")
+    for token in tokens[:2]:
+        if token in _SIDO_ALIASES:
+            return _SIDO_ALIASES[token]
+
+    # Fallback: substring scan for long-form names
+    for key, canonical in _SIDO_ALIASES.items():
+        if key and key in cleaned:
+            return canonical
+
+    return None
+
+
+def _sido_name_variants(canonical: str) -> List[str]:
+    if not canonical:
+        return []
+    variants = {canonical}
+    # Add common full names used by different data sources.
+    full_map = {
+        "서울": "서울특별시",
+        "부산": "부산광역시",
+        "대구": "대구광역시",
+        "인천": "인천광역시",
+        "광주": "광주광역시",
+        "대전": "대전광역시",
+        "울산": "울산광역시",
+        "세종": "세종특별자치시",
+        "경기": "경기도",
+        "강원": "강원도",
+        "충북": "충청북도",
+        "충남": "충청남도",
+        "전북": "전라북도",
+        "전남": "전라남도",
+        "경북": "경상북도",
+        "경남": "경상남도",
+        "제주": "제주특별자치도",
+    }
+    if canonical in full_map:
+        variants.add(full_map[canonical])
+    return sorted(variants)
+
+
+def _grade_from_value(pollutant: str, value: Any) -> Optional[str]:
+    """
+    Derive Korean grade text from raw values for consistency checks.
+    Returns one of: '좋음', '보통', '나쁨', '매우나쁨', or None if unknown.
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except Exception:
+        return None
+
+    p = (pollutant or "").lower().strip()
+    # Breakpoints reflect commonly used AirKorea-style 4-step guidance.
+    if p == "pm25":
+        if v <= 15: return "좋음"
+        if v <= 35: return "보통"
+        if v <= 75: return "나쁨"
+        return "매우나쁨"
+    if p == "pm10":
+        if v <= 30: return "좋음"
+        if v <= 80: return "보통"
+        if v <= 150: return "나쁨"
+        return "매우나쁨"
+    if p == "o3":
+        # ppm
+        if v <= 0.03: return "좋음"
+        if v <= 0.09: return "보통"
+        if v <= 0.15: return "나쁨"
+        return "매우나쁨"
+    if p == "no2":
+        # ppm
+        if v <= 0.03: return "좋음"
+        if v <= 0.06: return "보통"
+        if v <= 0.20: return "나쁨"
+        return "매우나쁨"
+    if p == "co":
+        # ppm
+        if v <= 2.0: return "좋음"
+        if v <= 9.0: return "보통"
+        if v <= 15.0: return "나쁨"
+        return "매우나쁨"
+    if p == "so2":
+        # ppm
+        if v <= 0.02: return "좋음"
+        if v <= 0.05: return "보통"
+        if v <= 0.15: return "나쁨"
+        return "매우나쁨"
+    return None
+
+
+def _max_korean_grade(*grades: Optional[str]) -> str:
+    best = "좋음"
+    best_score = 1
+    for g in grades:
+        if not g:
+            continue
+        s = GRADE_MAP.get(g, 2)
+        if s > best_score:
+            best_score = s
+            best = g
+    return best
 
 
 def _parse_datetime_to_kst(value: Any) -> Optional[datetime]:
@@ -414,19 +598,18 @@ def _calculate_decision(pm25_grade: str, o3_grade: str) -> str:
     """
     p_score = GRADE_MAP.get(pm25_grade, 2)
     o_score = GRADE_MAP.get(o3_grade, 2)
-    
-    # Check Warning Conditions
-    if p_score >= 4 or o_score >= 4:
+
+    # Keep the original semantics, but simplify into "worst grade wins".
+    worst = max(p_score, o_score)
+    if worst >= 4:
         return "warning"
-    if p_score == 3 and o_score == 3:
-        return "warning"
-        
-    # Check Caution Conditions
-    if p_score == 3 or o_score == 3:
+    if worst == 3:
         return "caution"
-        
-    # Default OK
     return "ok"
+
+
+def _escalate_decision_key(decision_key: str) -> str:
+    return {"ok": "caution", "caution": "warning", "warning": "warning"}.get(decision_key, decision_key)
 
 def _normalize_age_group(age_group: Any) -> str:
     if age_group is None:
@@ -495,6 +678,13 @@ async def get_air_quality_from_mongodb(station_name: str) -> Optional[Dict[str, 
         return None
     
     try:
+        station_name_cleaned = " ".join((station_name or "").strip().split())
+        first_token = station_name_cleaned.split(" ")[0] if station_name_cleaned else ""
+        explicit_sido_prefix = first_token in _SIDO_ALIASES
+
+        preferred_sido = _infer_preferred_sido_from_text(station_name)
+        preferred_sido_variants = _sido_name_variants(preferred_sido) if preferred_sido else []
+
         station_candidates = _normalize_station_candidates(station_name)
         if not station_candidates:
             return None
@@ -506,6 +696,19 @@ async def get_air_quality_from_mongodb(station_name: str) -> Optional[Dict[str, 
         matched_candidate = None
 
         for candidate in station_candidates:
+            if preferred_sido_variants:
+                data = await air_quality_db[AIR_QUALITY_DATA_COLLECTION].find_one(
+                    {"stationName": candidate, "sidoName": {"$in": preferred_sido_variants}},
+                    sort=sort_criteria
+                )
+                if data:
+                    matched_candidate = candidate
+                    break
+                # If the user explicitly specified a city/province (e.g., starts with '부산'),
+                # do not silently fall back to a different region with the same stationName.
+                if explicit_sido_prefix:
+                    continue
+
             data = await air_quality_db[AIR_QUALITY_DATA_COLLECTION].find_one(
                 {"stationName": candidate},
                 sort=sort_criteria
@@ -537,14 +740,6 @@ async def get_air_quality_from_mongodb(station_name: str) -> Optional[Dict[str, 
         # Convert grade strings to Korean text
         grade_map = {"1": "좋음", "2": "보통", "3": "나쁨", "4": "매우나쁨"}
 
-        # Support both camelCase (Lambda docs) and snake_case (legacy docs)
-        pm25_grade_value = data.get("pm25Grade", data.get("pm25_grade", "2"))
-        pm10_grade_value = data.get("pm10Grade", data.get("pm10_grade", "2"))
-        o3_grade_value = data.get("o3Grade", data.get("o3_grade", "1"))
-        no2_grade_value = data.get("no2Grade", data.get("no2_grade", "1"))
-        co_grade_value = data.get("coGrade", data.get("co_grade", "1"))
-        so2_grade_value = data.get("so2Grade", data.get("so2_grade", "1"))
-
         def _coerce_number(value: Any) -> Optional[float]:
             if value is None:
                 return None
@@ -559,6 +754,23 @@ async def get_air_quality_from_mongodb(station_name: str) -> Optional[Dict[str, 
             except Exception:
                 return None
 
+        # Support both camelCase (Lambda docs) and snake_case (legacy docs)
+        pm25_value = _coerce_number(data.get("pm25Value", data.get("pm25_value")))
+        pm10_value = _coerce_number(data.get("pm10Value", data.get("pm10_value")))
+        o3_value = _coerce_number(data.get("o3Value", data.get("o3_value")))
+        no2_value = _coerce_number(data.get("no2Value", data.get("no2_value")))
+        co_value = _coerce_number(data.get("coValue", data.get("co_value")))
+        so2_value = _coerce_number(data.get("so2Value", data.get("so2_value")))
+
+        # We intentionally do NOT trust stored Grade fields because they can drift from Value.
+        # Use them only when a numeric value is missing.
+        pm25_grade_value = data.get("pm25Grade", data.get("pm25_grade"))
+        pm10_grade_value = data.get("pm10Grade", data.get("pm10_grade"))
+        o3_grade_value = data.get("o3Grade", data.get("o3_grade"))
+        no2_grade_value = data.get("no2Grade", data.get("no2_grade"))
+        co_grade_value = data.get("coGrade", data.get("co_grade"))
+        so2_grade_value = data.get("so2Grade", data.get("so2_grade"))
+
         temp_raw = data.get("temperature")
         if temp_raw is None:
             temp_raw = data.get("temp")
@@ -567,21 +779,29 @@ async def get_air_quality_from_mongodb(station_name: str) -> Optional[Dict[str, 
         temp_value = _coerce_number(temp_raw)
         humidity_value = _coerce_number(humidity_raw)
 
+        def _grade_from_value_or_fallback(pollutant: str, value: Optional[float], fallback_grade_value: Any, default: str) -> str:
+            computed = _grade_from_value(pollutant, value)
+            if computed:
+                return computed
+            if fallback_grade_value is None:
+                return default
+            return grade_map.get(str(fallback_grade_value), default)
+
         result = {
             "stationName": data.get("stationName", station_name),
             "sidoName": data.get("sidoName"),
-            "pm25_grade": grade_map.get(str(pm25_grade_value), "보통"),
-            "pm25_value": data.get("pm25Value", data.get("pm25_value", 50)),
-            "pm10_grade": grade_map.get(str(pm10_grade_value), "보통"),
-            "pm10_value": data.get("pm10Value", data.get("pm10_value", 70)),
-            "o3_grade": grade_map.get(str(o3_grade_value), "좋음"),
-            "o3_value": data.get("o3Value", data.get("o3_value", 0.05)),
-            "no2_grade": grade_map.get(str(no2_grade_value), "좋음"),
-            "no2_value": data.get("no2Value", data.get("no2_value", 0.02)),
-            "co_grade": grade_map.get(str(co_grade_value), "좋음"),
-            "co_value": data.get("coValue", data.get("co_value", 0.5)),
-            "so2_grade": grade_map.get(str(so2_grade_value), "좋음"),
-            "so2_value": data.get("so2Value", data.get("so2_value", 0.003)),
+            "pm25_value": pm25_value if pm25_value is not None else 50,
+            "pm10_value": pm10_value if pm10_value is not None else 70,
+            "o3_value": o3_value if o3_value is not None else 0.05,
+            "no2_value": no2_value if no2_value is not None else 0.02,
+            "co_value": co_value if co_value is not None else 0.5,
+            "so2_value": so2_value if so2_value is not None else 0.003,
+            "pm25_grade": _grade_from_value_or_fallback("pm25", pm25_value, pm25_grade_value, "보통"),
+            "pm10_grade": _grade_from_value_or_fallback("pm10", pm10_value, pm10_grade_value, "보통"),
+            "o3_grade": _grade_from_value_or_fallback("o3", o3_value, o3_grade_value, "좋음"),
+            "no2_grade": _grade_from_value_or_fallback("no2", no2_value, no2_grade_value, "좋음"),
+            "co_grade": _grade_from_value_or_fallback("co", co_value, co_grade_value, "좋음"),
+            "so2_grade": _grade_from_value_or_fallback("so2", so2_value, so2_grade_value, "좋음"),
             # Lambda now stores weather on the same document.
             # Support both `temperature` (Lambda) and `temp` (legacy/other sources).
             "temp": temp_value,
@@ -615,46 +835,80 @@ async def get_air_quality_from_airkorea_api(station_name: str) -> Optional[Dict[
     AIRKOREA_API_URL = "https://epi-log-airkorea.vercel.app/api/stations"
     
     try:
+        station_name_cleaned = " ".join((station_name or "").strip().split())
+        first_token = station_name_cleaned.split(" ")[0] if station_name_cleaned else ""
+        explicit_sido_prefix = first_token in _SIDO_ALIASES
+
+        preferred_sido = _infer_preferred_sido_from_text(station_name)
+        preferred_sido_variants = _sido_name_variants(preferred_sido) if preferred_sido else []
+
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                AIRKOREA_API_URL,
-                params={"stationName": station_name}
-            )
-            
-            if response.status_code == 200:
+            station_candidates = _normalize_station_candidates(station_name)
+            if not station_candidates:
+                station_candidates = [station_name]
+
+            # Try a few candidate queries to avoid false misses when users pass full addresses.
+            for candidate in station_candidates[:6]:
+                response = await client.get(
+                    AIRKOREA_API_URL,
+                    params={"stationName": candidate}
+                )
+
+                if response.status_code != 200:
+                    continue
+
                 data = response.json()
-                
-                # API returns array, take first item
-                if data and len(data) > 0:
+                if not data:
+                    continue
+
+                # API returns array; when ambiguous (e.g., '강서구'), prefer matching sidoName.
+                station = None
+                if preferred_sido_variants:
+                    for item in data:
+                        if item.get("sidoName") in preferred_sido_variants:
+                            station = item
+                            break
+                    if station is None and explicit_sido_prefix:
+                        # Explicit city/province prefix but no matching station in that region.
+                        # Try next candidate rather than returning a wrong-region station.
+                        continue
+                if station is None:
                     station = data[0]
-                    realtime = station.get("realtime", {})
-                    
-                    # Convert grade numbers to Korean text
-                    grade_map = {1: "좋음", 2: "보통", 3: "나쁨", 4: "매우나쁨"}
-                    
-                    # Extract and normalize data
-                    result = {
-                        "stationName": station.get("stationName", station_name),
-                        "sidoName": station.get("sidoName"),
-                        "pm25_grade": grade_map.get(realtime.get("pm25", {}).get("grade"), "보통"),
-                        "pm25_value": realtime.get("pm25", {}).get("value") or 50,
-                        "pm10_grade": grade_map.get(realtime.get("pm10", {}).get("grade"), "보통"),
-                        "pm10_value": realtime.get("pm10", {}).get("value") or 70,
-                        "o3_grade": grade_map.get(realtime.get("o3", {}).get("grade"), "보통"),
-                        "o3_value": realtime.get("o3", {}).get("value") or 0.05,
-                        "no2_grade": grade_map.get(realtime.get("no2", {}).get("grade"), "좋음"),
-                        "no2_value": realtime.get("no2", {}).get("value") or 0.02,
-                        "co_grade": grade_map.get(realtime.get("co", {}).get("grade"), "좋음"),
-                        "co_value": realtime.get("co", {}).get("value") or 0.5,
-                        "so2_grade": grade_map.get(realtime.get("so2", {}).get("grade"), "좋음"),
-                        "so2_value": realtime.get("so2", {}).get("value") or 0.003,
-                        "temp": None,
-                        "humidity": None,
-                        "dataTime": realtime.get("dataTime") or station.get("dataTime")
-                    }
-                    
-                    print(f"✅ Fetched air quality for {station_name} from Air Korea API (fallback)")
-                    return result
+
+                realtime = station.get("realtime", {})
+
+                # We do NOT trust `grade` from upstream. Recompute grade from numeric values.
+
+                # Extract and normalize data
+                pm25_value = realtime.get("pm25", {}).get("value")
+                pm10_value = realtime.get("pm10", {}).get("value")
+                o3_value = realtime.get("o3", {}).get("value")
+                no2_value = realtime.get("no2", {}).get("value")
+                co_value = realtime.get("co", {}).get("value")
+                so2_value = realtime.get("so2", {}).get("value")
+
+                result = {
+                    "stationName": station.get("stationName", candidate),
+                    "sidoName": station.get("sidoName"),
+                    "pm25_value": pm25_value or 50,
+                    "pm10_value": pm10_value or 70,
+                    "o3_value": o3_value or 0.05,
+                    "no2_value": no2_value or 0.02,
+                    "co_value": co_value or 0.5,
+                    "so2_value": so2_value or 0.003,
+                    "pm25_grade": _grade_from_value("pm25", pm25_value) or "보통",
+                    "pm10_grade": _grade_from_value("pm10", pm10_value) or "보통",
+                    "o3_grade": _grade_from_value("o3", o3_value) or "보통",
+                    "no2_grade": _grade_from_value("no2", no2_value) or "좋음",
+                    "co_grade": _grade_from_value("co", co_value) or "좋음",
+                    "so2_grade": _grade_from_value("so2", so2_value) or "좋음",
+                    "temp": None,
+                    "humidity": None,
+                    "dataTime": realtime.get("dataTime") or station.get("dataTime")
+                }
+
+                print(f"✅ Fetched air quality for {station_name} from Air Korea API (fallback, matched={candidate})")
+                return result
         
         print(f"⚠️  No data from Air Korea API for {station_name}")
         return None
@@ -897,8 +1151,25 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
             "references": []
         }
 
-    # [Logic Update] Calculate Deterministic Decision & Action Items using CORRECTED grades
-    decision_key = _calculate_decision(pm25_corrected, o3_corrected)
+    # [Logic Update] Calculate Deterministic Decision & Action Items using worst-of (PM2.5, PM10, O3).
+    # This prevents "OK" copy from showing up when any core pollutant is actually bad.
+    worst_grade = _max_korean_grade(pm25_corrected, air_data.get("pm10_grade"), o3_corrected)
+    worst_score = GRADE_MAP.get(worst_grade, 2)
+    if worst_score >= 4:
+        decision_key = "warning"
+    elif worst_score == 3:
+        decision_key = "caution"
+    else:
+        decision_key = "ok"
+
+    # Weather sensitivity: for younger groups, cold/heat can effectively increase risk by one level.
+    if age_group in {"infant", "toddler", "elementary_low"} and temp is not None:
+        try:
+            t = float(temp)
+            if t < 5 or t > 30:
+                decision_key = _escalate_decision_key(decision_key)
+        except Exception:
+            pass
     decision_text, action_items = _get_display_content(age_group, user_condition, decision_key)
     
     # O3 Special Handling: Force-Append and Warnings
