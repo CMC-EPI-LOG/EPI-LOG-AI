@@ -102,6 +102,38 @@ curl -X POST -F "file=@/path/to/paper.pdf" "https://<your-domain>/api/ingest/pdf
 
 ---
 
+## 3. OpenAI Responses Proxy (Server-to-Server)
+OpenAI Responses API 호출을 이 서버가 중계합니다.
+
+- **Health Endpoint:** `GET /api/openai/v1/health`
+- **Proxy Endpoint:** `POST /api/openai/v1/responses`
+- **Content-Type:** `application/json`
+
+### Security
+- `OPENAI_PROXY_TOKEN`이 설정된 경우, 요청 헤더 `x-proxy-token`이 반드시 일치해야 합니다.
+
+### Request Body
+- OpenAI Responses API payload를 그대로 전달합니다.
+
+### Example Request
+```bash
+curl -X POST "https://<your-domain>/api/openai/v1/responses" \
+  -H "Content-Type: application/json" \
+  -H "x-proxy-token: <OPENAI_PROXY_TOKEN>" \
+  -d '{
+    "model": "gpt-5-nano",
+    "input": [{"role":"user","content":[{"type":"input_text","text":"hello"}]}]
+  }'
+```
+
+### Example Worker Setting
+EPI-LOG-USERLOG Worker에서는 아래처럼 설정하면 이 프록시를 사용합니다.
+
+- `OPENAI_BASE_URL=https://<your-domain>/api/openai/v1`
+- 프록시 토큰 헤더(`x-proxy-token`)가 필요하면 Worker 코드에서 함께 전달해야 합니다.
+
+---
+
 ## Deployment to Vercel
 
 1. **Install Vercel CLI** (if not installed):
@@ -119,3 +151,6 @@ curl -X POST -F "file=@/path/to/paper.pdf" "https://<your-domain>/api/ingest/pdf
    - `MONGODB_URI`
    - `VOYAGE_API_KEY`
    - `OPENAI_API_KEY`
+   - `OPENAI_PROXY_TOKEN` (optional but recommended)
+   - `OPENAI_UPSTREAM_BASE_URL` (optional, default `https://api.openai.com/v1`)
+   - `OPENAI_PROXY_TIMEOUT_SECONDS` (optional, default `60`)

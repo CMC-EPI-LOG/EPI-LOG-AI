@@ -7,6 +7,7 @@ import os
 from contextlib import asynccontextmanager
 
 from app.services import get_medical_advice, ingest_pdf, db
+from app.openai_proxy import router as openai_proxy_router
 
 # Define Request Model
 class AdviceRequest(BaseModel):
@@ -33,6 +34,7 @@ async def lifespan(app: FastAPI):
         pass
 
 app = FastAPI(title="Epilogue API", lifespan=lifespan)
+app.include_router(openai_proxy_router)
 
 @app.get("/")
 def read_root():

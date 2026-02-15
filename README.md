@@ -159,11 +159,44 @@ sequenceDiagram
   - `400`: PDF가 아닌 파일 업로드
   - `500`: 처리 실패
 
+### 4) OpenAI Responses Proxy (Server-to-Server)
+
+- **GET** `/api/openai/v1/health`
+- **Response**
+  - `ok`: Boolean
+  - `service`: `"openai-proxy"`
+  - `upstream_base_url`: String
+  - `proxy_token_required`: Boolean
+  - `openai_key_configured`: Boolean
+
+- **POST** `/api/openai/v1/responses`
+- **Content-Type**: `application/json`
+- **Header**
+  - `x-proxy-token`: String (required when `OPENAI_PROXY_TOKEN` is set)
+- **Body**
+  - OpenAI Responses API payload 그대로 전달
+- **Response**
+  - OpenAI `/v1/responses`의 status/body를 그대로 반환
+
+예시:
+```bash
+curl -X POST "https://<your-domain>/api/openai/v1/responses" \
+  -H "Content-Type: application/json" \
+  -H "x-proxy-token: <OPENAI_PROXY_TOKEN>" \
+  -d '{
+    "model": "gpt-5-nano",
+    "input": [{"role":"user","content":[{"type":"input_text","text":"test"}]}]
+  }'
+```
+
 ## 환경 변수
 
 - `MONGODB_URI` (or `MONGO_URI`)
 - `VOYAGE_API_KEY`
 - `OPENAI_API_KEY`
+- `OPENAI_PROXY_TOKEN` (권장, 프록시 보호용)
+- `OPENAI_UPSTREAM_BASE_URL` (기본: `https://api.openai.com/v1`)
+- `OPENAI_PROXY_TIMEOUT_SECONDS` (기본: `60`)
 
 ## 실행 방법
 
