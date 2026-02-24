@@ -153,4 +153,4 @@ EPI-LOG-USERLOG Worker에서는 아래처럼 설정하면 이 프록시를 사�
    - `OPENAI_API_KEY`
    - `OPENAI_PROXY_TOKEN` (optional but recommended)
    - `OPENAI_UPSTREAM_BASE_URL` (optional, default `https://api.openai.com/v1`)
-   - `OPENAI_PROXY_TIMEOUT_SECONDS` (optional, default `180`)
+   - `OPENAI_PROXY_TIMEOUT_SECONDS` (optional, default `300`)

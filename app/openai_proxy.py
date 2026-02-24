@@ -13,7 +13,7 @@ def _settings() -> Dict[str, Any]:
         "openai_api_key": os.getenv("OPENAI_API_KEY"),
         "proxy_token": os.getenv("OPENAI_PROXY_TOKEN"),
         "upstream_base_url": (os.getenv("OPENAI_UPSTREAM_BASE_URL") or "https://api.openai.com/v1").rstrip("/"),
-        "timeout_seconds": float(os.getenv("OPENAI_PROXY_TIMEOUT_SECONDS") or "180")
+        "timeout_seconds": float(os.getenv("OPENAI_PROXY_TIMEOUT_SECONDS") or "300")
     }
 
 

@@ -196,7 +196,7 @@ curl -X POST "https://<your-domain>/api/openai/v1/responses" \
 - `OPENAI_API_KEY`
 - `OPENAI_PROXY_TOKEN` (권장, 프록시 보호용)
 - `OPENAI_UPSTREAM_BASE_URL` (기본: `https://api.openai.com/v1`)
-- `OPENAI_PROXY_TIMEOUT_SECONDS` (기본: `180`)
+- `OPENAI_PROXY_TIMEOUT_SECONDS` (기본: `300`)
 
 ## 실행 방법
 
