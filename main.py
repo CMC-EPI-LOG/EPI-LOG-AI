@@ -6,7 +6,7 @@ import uvicorn
 import os
 from contextlib import asynccontextmanager
 
-from app.services import get_medical_advice, ingest_pdf, db
+from app.services import get_medical_advice, ingest_pdf, db, get_clothing_recommendation
 from app.openai_proxy import router as openai_proxy_router
 
 # Define Request Model
@@ -21,6 +21,21 @@ class AdviceResponse(BaseModel):
     detail_answer: str       # Detailed medical explanation
     actionItems: List[str]
     references: List[str]
+
+
+class ClothingRecommendationRequest(BaseModel):
+    temperature: float = 22.0
+    humidity: float = 45.0
+
+
+class ClothingRecommendationResponse(BaseModel):
+    summary: str
+    recommendation: str
+    tips: List[str]
+    comfortLevel: str
+    temperature: float
+    humidity: float
+    source: str
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -88,6 +103,27 @@ async def get_air_quality_endpoint(stationName: str):
         return JSONResponse(
             status_code=500,
             content={"error": "Internal Server Error", "details": str(e)}
+        )
+
+
+@app.post("/api/clothing-recommendation", response_model=ClothingRecommendationResponse)
+async def clothing_recommendation(request: ClothingRecommendationRequest):
+    try:
+        result = get_clothing_recommendation(request.temperature, request.humidity)
+        return JSONResponse(content=result)
+    except Exception as e:
+        print(f"Error generating clothing recommendation: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "summary": "옷차림 추천을 불러오지 못했어요.",
+                "recommendation": "얇은 겉옷을 함께 준비해 체온 변화를 조절해 주세요.",
+                "tips": ["실내외 온도차를 고려해 레이어드 착용을 권장해요."],
+                "comfortLevel": "UNKNOWN",
+                "temperature": float(request.temperature),
+                "humidity": float(request.humidity),
+                "source": "fallback"
+            },
         )
 
 from fastapi import UploadFile, File
