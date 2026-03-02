@@ -1,9 +1,11 @@
 import os
 import json
+import csv
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional, Any
 from urllib.parse import urlparse
+from pathlib import Path
 import voyageai
 from openai import OpenAI
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -359,6 +361,156 @@ def _parse_datetime_to_kst(value: Any) -> Optional[datetime]:
 
     return dt.astimezone(KST_TZ)
 
+
+def _coerce_number(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def get_clothing_recommendation(temp: Any, humidity: Any) -> Dict[str, Any]:
+    """
+    Return deterministic clothing guidance based on current temperature/humidity.
+    """
+    temperature = _coerce_number(temp)
+    humid = _coerce_number(humidity)
+
+    if temperature is None:
+        temperature = 22.0
+    if humid is None:
+        humid = 45.0
+
+    if temperature < -5:
+        comfort_level = "FREEZING"
+        recommendation = "패딩 + 두꺼운 니트 + 내복 + 목도리/장갑"
+        summary = "한파 수준이에요. 방한 장비를 최대치로 준비하세요."
+    elif temperature < 5:
+        comfort_level = "COLD"
+        recommendation = "두꺼운 코트/패딩 + 기모 상의 + 긴바지"
+        summary = "매우 추워요. 보온 중심 레이어링이 필요해요."
+    elif temperature < 12:
+        comfort_level = "CHILLY"
+        recommendation = "트렌치/자켓 + 긴팔 상의 + 긴바지"
+        summary = "쌀쌀한 편이에요. 가벼운 겉옷을 꼭 챙기세요."
+    elif temperature < 20:
+        comfort_level = "MILD"
+        recommendation = "가디건/맨투맨 + 긴바지"
+        summary = "활동하기 무난한 기온이에요."
+    elif temperature < 27:
+        comfort_level = "WARM"
+        recommendation = "반팔 + 얇은 셔츠(또는 가디건) + 통풍 좋은 하의"
+        summary = "다소 따뜻해요. 얇고 통풍 잘되는 옷이 좋아요."
+    else:
+        comfort_level = "HOT"
+        recommendation = "반팔 + 반바지/얇은 바지 + 통풍 좋은 소재"
+        summary = "더운 날씨예요. 열 배출이 잘되는 복장이 좋아요."
+
+    tips: List[str] = []
+
+    if humid >= 75:
+        tips.append("습도가 높아요. 땀 배출이 잘되는 기능성/면 혼방 소재를 권장해요.")
+        if temperature >= 25:
+            tips.append("더위 체감이 커질 수 있어요. 여벌 옷을 준비해 주세요.")
+    elif humid <= 30:
+        tips.append("건조한 편이에요. 얇은 겉옷으로 피부 건조와 냉기를 함께 관리하세요.")
+    else:
+        tips.append("현재 습도는 비교적 안정적이에요. 활동량에 맞춰 한 겹 조절하면 좋아요.")
+
+    if temperature <= 5:
+        tips.append("실내외 온도차가 큰 날이에요. 탈착 가능한 겉옷 구성이 안전해요.")
+    elif temperature >= 28:
+        tips.append("실외 활동 시 밝은 색, 통풍 좋은 소재를 추천해요.")
+
+    return {
+        "summary": summary,
+        "recommendation": recommendation,
+        "tips": tips[:3],
+        "comfortLevel": comfort_level,
+        "temperature": round(temperature, 1),
+        "humidity": round(humid, 1),
+        "source": "rule-based-v1"
+    }
+
+
+CSV_AGE_MAP = {
+    "영아(0-2세)": "infant",
+    "유아(3-6세)": "toddler",
+    "초등저(7-9세)": "elementary_low",
+    "초등고(10-12)": "elementary_high",
+    "청소년/성인": "teen_adult",
+}
+
+CSV_CONDITION_MAP = {
+    "일반": "general",
+    "비염": "rhinitis",
+    "천식": "asthma",
+    "아토피": "atopy",
+}
+
+GRADE_ORDER = ("좋음", "보통", "나쁨", "매우나쁨")
+
+
+def _load_decision_matrix_from_csv() -> Dict[str, Dict[str, Dict[str, Dict[str, Any]]]]:
+    """
+    Load the full 80-row decision matrix from logic.csv.
+    Matrix shape: age_group -> condition -> grade -> {text, reason, actions}
+    """
+    csv_path = os.getenv("DECISION_LOGIC_CSV_PATH")
+    if csv_path:
+        path = Path(csv_path).expanduser()
+    else:
+        path = Path(__file__).resolve().parents[1] / "logic.csv"
+
+    if not path.exists():
+        print(f"⚠️ decision matrix CSV not found: {path}")
+        return {}
+
+    matrix: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
+    loaded_rows = 0
+
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                age_key = CSV_AGE_MAP.get((row.get("연령대") or "").strip())
+                cond_key = CSV_CONDITION_MAP.get((row.get("질환군") or "").strip())
+                grade_key = (row.get("대기등급") or "").strip()
+
+                if not age_key or not cond_key or grade_key not in GRADE_ORDER:
+                    continue
+
+                action_items: List[str] = []
+                for action_col in ("행동1", "행동2", "행동3"):
+                    action_value = (row.get(action_col) or "").strip()
+                    if action_value:
+                        action_items.append(action_value)
+
+                matrix.setdefault(age_key, {}).setdefault(cond_key, {})[grade_key] = {
+                    "text": (row.get("메인문구") or "").strip(),
+                    "reason": (row.get("이유") or "").strip(),
+                    "actions": action_items,
+                }
+                loaded_rows += 1
+    except Exception as e:
+        print(f"⚠️ failed to load decision matrix CSV: {e}")
+        return {}
+
+    expected_rows = len(CSV_AGE_MAP) * len(CSV_CONDITION_MAP) * len(GRADE_ORDER)
+    if loaded_rows != expected_rows:
+        print(
+            f"⚠️ decision matrix coverage mismatch: loaded={loaded_rows}, expected={expected_rows}, path={path}"
+        )
+    else:
+        print(f"✅ decision matrix loaded: {loaded_rows} rows from {path}")
+
+    return matrix
+
+
+DECISION_MATRIX = _load_decision_matrix_from_csv()
+
 # Decision Texts based on logic.csv (80-segment dataset)
 DECISION_TEXTS = {
     "infant": {
@@ -589,17 +741,10 @@ ACTION_ITEMS = {
 
 def _calculate_decision(pm25_grade: str, o3_grade: str) -> str:
     """
-    Calculate decision level: 'ok', 'caution', 'warning'
-    
-    Logic (1:좋음, 2:보통, 3:나쁨, 4:매우나쁨):
-    • OK: PM2.5 <= 2 AND O3 <= 2
-    • Caution: Either one is 3
-    • Warning: Either one is 4 OR Both are 3
+    Legacy helper for 3-level decision key.
     """
     p_score = GRADE_MAP.get(pm25_grade, 2)
     o_score = GRADE_MAP.get(o3_grade, 2)
-
-    # Keep the original semantics, but simplify into "worst grade wins".
     worst = max(p_score, o_score)
     if worst >= 4:
         return "warning"
@@ -608,8 +753,21 @@ def _calculate_decision(pm25_grade: str, o3_grade: str) -> str:
     return "ok"
 
 
-def _escalate_decision_key(decision_key: str) -> str:
-    return {"ok": "caution", "caution": "warning", "warning": "warning"}.get(decision_key, decision_key)
+def _calculate_final_grade(pm25_grade: str, pm10_grade: Optional[str], o3_grade: str) -> str:
+    return _max_korean_grade(pm25_grade, pm10_grade, o3_grade)
+
+
+def _escalate_grade_score(score: int) -> int:
+    return min(4, max(1, int(score) + 1))
+
+
+def _grade_to_legacy_decision_key(grade: str) -> str:
+    score = GRADE_MAP.get(grade, 2)
+    if score >= 4:
+        return "warning"
+    if score == 3:
+        return "caution"
+    return "ok"
 
 def _normalize_age_group(age_group: Any) -> str:
     if age_group is None:
@@ -637,24 +795,38 @@ def _normalize_age_group(age_group: Any) -> str:
     
     return "elementary_high"
 
-def _get_display_content(age_group: str, condition: str, decision_key: str):
+def _get_display_content(age_group: str, condition: str, final_grade: str):
     """
-    Returns (decision_text, action_items)
+    Returns (decision_text, action_items, reason_text)
     """
     # Normalize condition
     cond_key = condition if condition in ["general", "rhinitis", "asthma", "atopy"] else "general"
-    
-    # Get Text
-    group_data = DECISION_TEXTS.get(age_group, DECISION_TEXTS["elementary_high"])
+
+    # Primary: full 80-row CSV decision matrix (4 grades).
+    matrix_age_key = age_group if age_group in DECISION_MATRIX else "elementary_high"
+    group_data = DECISION_MATRIX.get(matrix_age_key, {})
     cond_data = group_data.get(cond_key, group_data.get("general", {}))
-    d_text = cond_data.get(decision_key, "상태 확인 필요")
-    
-    # Get Actions
-    group_actions = ACTION_ITEMS.get(age_group, ACTION_ITEMS.get("toddler", {}))
-    cond_actions = group_actions.get(cond_key, group_actions.get("general", {}))
-    actions = cond_actions.get(decision_key, ["상태에 따른 주의가 필요합니다."])
-    
-    return d_text, actions[:] # Return a copy
+    entry = cond_data.get(final_grade)
+
+    if entry:
+        d_text = (entry.get("text") or "").strip() or "상태 확인 필요"
+        reason = (entry.get("reason") or "").strip()
+        actions = entry.get("actions") if isinstance(entry.get("actions"), list) else []
+        if not actions:
+            actions = ["상태에 따른 주의가 필요합니다."]
+        return d_text, actions[:], reason
+
+    # Fallback: legacy in-code 60-slot table.
+    decision_key = _grade_to_legacy_decision_key(final_grade)
+    legacy_text_by_age = DECISION_TEXTS.get(age_group, DECISION_TEXTS["elementary_high"])
+    legacy_text_by_cond = legacy_text_by_age.get(cond_key, legacy_text_by_age.get("general", {}))
+    d_text = legacy_text_by_cond.get(decision_key, "상태 확인 필요")
+
+    legacy_actions_by_age = ACTION_ITEMS.get(age_group, ACTION_ITEMS.get("toddler", {}))
+    legacy_actions_by_cond = legacy_actions_by_age.get(cond_key, legacy_actions_by_age.get("general", {}))
+    actions = legacy_actions_by_cond.get(decision_key, ["상태에 따른 주의가 필요합니다."])
+
+    return d_text, actions[:], ""
 
 try:
     vo_client = voyageai.Client(api_key=VOYAGE_API_KEY)
@@ -1151,26 +1323,21 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
             "references": []
         }
 
-    # [Logic Update] Calculate Deterministic Decision & Action Items using worst-of (PM2.5, PM10, O3).
-    # This prevents "OK" copy from showing up when any core pollutant is actually bad.
-    worst_grade = _max_korean_grade(pm25_corrected, air_data.get("pm10_grade"), o3_corrected)
-    worst_score = GRADE_MAP.get(worst_grade, 2)
-    if worst_score >= 4:
-        decision_key = "warning"
-    elif worst_score == 3:
-        decision_key = "caution"
-    else:
-        decision_key = "ok"
+    # Calculate 4-level final grade and map directly into the 80-row matrix.
+    final_grade = _calculate_final_grade(pm25_corrected, air_data.get("pm10_grade"), o3_corrected)
+    final_grade_score = GRADE_MAP.get(final_grade, 2)
 
     # Weather sensitivity: for younger groups, cold/heat can effectively increase risk by one level.
     if age_group in {"infant", "toddler", "elementary_low"} and temp is not None:
         try:
             t = float(temp)
             if t < 5 or t > 30:
-                decision_key = _escalate_decision_key(decision_key)
+                final_grade_score = _escalate_grade_score(final_grade_score)
         except Exception:
             pass
-    decision_text, action_items = _get_display_content(age_group, user_condition, decision_key)
+
+    final_grade = REVERSE_GRADE_MAP.get(final_grade_score, final_grade)
+    decision_text, action_items, csv_reason = _get_display_content(age_group, user_condition, final_grade)
     
     # O3 Special Handling: Force-Append and Warnings
     is_o3_dominant = GRADE_MAP.get(o3_corrected, 1) >= GRADE_MAP.get(pm25_corrected, 1)
@@ -1221,8 +1388,10 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     - 대기질: 초미세먼지={pm25_raw}(보정후:{pm25_corrected}), 오존={o3_raw}(보정후:{o3_corrected})
     - 환경: 온도={temp}°C, 습도={humidity}%
     - 사용자: 연령대={age_group}, 기저질환={user_condition}
+    - 시스템 최종등급(4단계): {final_grade}
     - 시스템 결정: {decision_text}
     - 시스템 행동수칙: {action_items}
+    - 결정데이터 근거 문장: {csv_reason or "해당 없음"}
     
     [의학적 가이드라인 (참고 문헌)]
     {context_text}
