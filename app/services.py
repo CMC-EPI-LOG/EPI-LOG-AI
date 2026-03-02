@@ -1426,6 +1426,8 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         # Merge Results
         final_result = {
             "decision": decision_text,
+            "csv_reason": csv_reason,
+            "reason": llm_result.get("detail_answer", "정보를 불러오는 중 문제가 발생했습니다."),
             "three_reason": llm_result.get("three_reason", [
                 "대기질 정보를 분석하고 있습니다.",
                 "잠시 후 다시 확인해주세요.",
@@ -1460,6 +1462,8 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         # Fallback even if LLM fails, we satisfy the deterministic requirement
         return {
             "decision": decision_text,
+            "csv_reason": csv_reason,
+            "reason": "일시적인 오류로 상세 설명을 불러오지 못했습니다. 하지만 행동 지침은 위와 같이 준수해주세요.",
             "three_reason": [
                 "일시적인 오류로 상세 분석을 불러오지 못했습니다.",
                 "하지만 **행동 지침**은 위와 같이 준수해주세요.",

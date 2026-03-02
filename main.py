@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import uvicorn
 import os
 from contextlib import asynccontextmanager
@@ -17,6 +17,8 @@ class AdviceRequest(BaseModel):
 # Define Response Model
 class AdviceResponse(BaseModel):
     decision: str
+    csv_reason: Optional[str] = None
+    reason: Optional[str] = None
     three_reason: List[str]  # 3 bullet points with **keyword** highlighting
     detail_answer: str       # Detailed medical explanation
     actionItems: List[str]
