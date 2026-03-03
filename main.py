@@ -1,12 +1,12 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import uvicorn
 import os
 from contextlib import asynccontextmanager
 
-from app.services import get_medical_advice, ingest_pdf, db, get_clothing_recommendation
+from app.services import get_medical_advice, ingest_pdf, db, get_ai_clothing_recommendation
 from app.openai_proxy import router as openai_proxy_router
 
 # Define Request Model
@@ -17,6 +17,8 @@ class AdviceRequest(BaseModel):
 # Define Response Model
 class AdviceResponse(BaseModel):
     decision: str
+    csv_reason: Optional[str] = None
+    reason: Optional[str] = None
     three_reason: List[str]  # 3 bullet points with **keyword** highlighting
     detail_answer: str       # Detailed medical explanation
     actionItems: List[str]
@@ -26,6 +28,9 @@ class AdviceResponse(BaseModel):
 class ClothingRecommendationRequest(BaseModel):
     temperature: float = 22.0
     humidity: float = 45.0
+    userProfile: Optional[Dict[str, Any]] = None
+    airQuality: Optional[Dict[str, Any]] = None
+    airGrade: Optional[str] = None
 
 
 class ClothingRecommendationResponse(BaseModel):
@@ -109,7 +114,16 @@ async def get_air_quality_endpoint(stationName: str):
 @app.post("/api/clothing-recommendation", response_model=ClothingRecommendationResponse)
 async def clothing_recommendation(request: ClothingRecommendationRequest):
     try:
-        result = get_clothing_recommendation(request.temperature, request.humidity)
+        air_quality = dict(request.airQuality or {})
+        if request.airGrade and not air_quality.get("grade"):
+            air_quality["grade"] = request.airGrade
+
+        result = get_ai_clothing_recommendation(
+            request.temperature,
+            request.humidity,
+            user_profile=request.userProfile,
+            air_quality=air_quality,
+        )
         return JSONResponse(content=result)
     except Exception as e:
         print(f"Error generating clothing recommendation: {e}")

@@ -20,19 +20,22 @@ Retrieves context-aware medical advice based on air quality and user profile.
 | `stationName` | String | Station name for Air Quality lookup | `"강남구"` |
 | `userProfile` | Object | User's health profile | See below |
 
-**`userProfile` Schema:**
+**`userProfile` Schema (canonical values):**
 ```json
 {
-  "ageGroup": "infant" | "elementary_low" | "elementary_high" | "teen",
-  "condition": "asthma" | "rhinitis" | "none" | "etc"
+  "ageGroup": "infant" | "toddler" | "elementary_low" | "elementary_high" | "teen_adult",
+  "condition": "general" | "rhinitis" | "asthma" | "atopy"
 }
 ```
 
-**`ageGroup` Label Guide (KR):**
-- `infant`: 유아
+Aliases like `teen`, `none`, `healthy`, `normal`, `일반` are accepted and normalized internally.
+
+**`ageGroup` Label Guide (KR, canonical):**
+- `infant`: 영아(0-2세)
+- `toddler`: 유아(3-6세)
 - `elementary_low`: 초등 저학년
 - `elementary_high`: 초등 고학년
-- `teen`: 청소년
+- `teen_adult`: 청소년/성인
 
 ### Example Request
 ```bash
@@ -47,35 +50,164 @@ curl -X POST "https://<your-domain>/api/advice" \
 ### Example Response
 ```json
 {
-  "decision": "오늘은 실내가 더 편해요 🏠",
+  "decision": "실내 놀이가 더 안전해요",
+  "csv_reason": "초미세먼지 농도가 높아 호흡기 자극 위험이 커졌어요.",
+  "reason": "초미세먼지와 오존 수준을 기준으로 행동 지침을 안내합니다.",
   "three_reason": [
-    "현재 미세먼지가 **나쁨** 수준이라 호흡기가 예민할 수 있어요.",
-    "특히 **천식**이 있다면 기도가 수축될 위험이 높습니다.",
-    "오늘은 **실외 활동**을 자제하고 마스크를 꼭 챙겨주세요."
+    "현재 **초미세먼지**가 높아 **호흡기 자극** 위험이 커졌어요.",
+    "특히 **천식**이 있다면 증상이 악화될 수 있어요.",
+    "오늘은 **실외 활동**을 줄이고 실내 공기질 관리가 필요해요."
   ],
-  "detail_answer": "현재 미세먼지 농도가 나쁨 수준이며, 천식 환자에게는 위험할 수 있습니다. 온도와 습도를 고려할 때 기도가 더욱 민감해질 수 있으므로, 실외 활동을 최소화하고 실내에서 안전하게 지내는 것이 좋습니다.",
+  "detail_answer": "현재 대기질과 사용자 프로필을 종합하면 실외 노출 최소화가 권장됩니다.",
   "actionItems": [
-    "외출 대신 장난감 정리+찾기 게임",
-    "실내에서 풍선배구/장애물 코스(가볍게)",
-    "환기는 짧게(5–10분) 하고 바로 닫기"
+    "외출 대신 실내 활동으로 대체하기",
+    "환기는 짧게 하고 즉시 닫기",
+    "귀가 후 손/얼굴 세정하기"
   ],
   "references": [
     "질병관리청 미세먼지 대응지침 2024",
     "천식 및 알레르기 학회 가이드라인"
-  ]
+  ],
+  "pm25_value": 51,
+  "pm10_value": 72,
+  "o3_value": 0.041,
+  "no2_value": 0.019
 }
 ```
 
 **Response Fields:**
-- `decision` (String): Short decision text from the system
-- `three_reason` (Array[String]): 3 concise summary points with `**keyword**` markers for frontend highlighting
-- `detail_answer` (String): Detailed medical explanation
-- `actionItems` (Array[String]): Recommended action items
-- `references` (Array[String]): Source references from medical guidelines
+- `decision` (String): CSV `메인문구` 기반의 최종 결정 문구
+- `csv_reason` (String | null): CSV `이유` 컬럼 값
+- `reason` (String | null): `detail_answer`와 동일한 상세 설명(호환용)
+- `three_reason` (Array[String]): 3개 핵심 요약 문장
+- `detail_answer` (String): 상세 설명
+- `actionItems` (Array[String]): CSV `행동1~3` 기반 행동 지침
+- `references` (Array[String]): 벡터 검색으로 참조된 출처
+- `pm25_value`, `pm10_value`, `o3_value`, `no2_value` (Number): 현재 대기질 수치(실행 시점에 포함될 수 있음)
+
+### CSV Mapping Rule
+`/api/advice`는 CSV 컬럼명을 그대로 반환하지 않고 아래처럼 매핑해서 반환합니다.
+
+| CSV Column | Returned Field | Returned? | Notes |
+|---|---|---|---|
+| `대기등급` | - | No | 내부에서 최종 등급 계산에 사용 |
+| `메인문구` | `decision` | Yes | 핵심 결정 문구 |
+| `연령대` | - | No | 요청 `userProfile.ageGroup`으로 입력받아 사용 |
+| `이유` | `csv_reason` | Yes | CSV 근거 문장 |
+| `질환군` | - | No | 요청 `userProfile.condition`으로 입력받아 사용 |
+| `행동1` | `actionItems[0]` | Yes | 행동 지침 배열 |
+| `행동2` | `actionItems[1]` | Yes | 행동 지침 배열 |
+| `행동3` | `actionItems[2]` | Yes | 행동 지침 배열 |
+
+Note: `ageGroup=infant`인 경우 `actionItems` 맨 앞에 `"※ 주의: 마스크 착용 금지(질식 위험)"` 경고 문구가 추가될 수 있습니다.
 
 ---
 
-## 2. Ingest PDF (Single File)
+## 2. Get Air Quality
+Returns latest air quality snapshot for a station (with internal fallback chain).
+
+- **Endpoint:** `GET /api/air-quality`
+- **Query Parameters:**
+
+| Field | Type | Required | Description | Example |
+|---|---|---|---|---|
+| `stationName` | String | Yes | 측정소/지역명 | `"종로구"` |
+
+### Example Request
+```bash
+curl -G "https://<your-domain>/api/air-quality" \
+  --data-urlencode "stationName=종로구"
+```
+
+### Example Response
+```json
+{
+  "stationName": "종로구",
+  "sidoName": "서울",
+  "pm25_value": 23,
+  "pm10_value": 41,
+  "o3_value": 0.031,
+  "no2_value": 0.018,
+  "co_value": 0.5,
+  "so2_value": 0.003,
+  "pm25_grade": "보통",
+  "pm10_grade": "보통",
+  "o3_grade": "보통",
+  "no2_grade": "좋음",
+  "co_grade": "좋음",
+  "so2_grade": "좋음",
+  "temp": 22.0,
+  "humidity": 45.0,
+  "dataTime": "2026-03-03 13:00"
+}
+```
+
+**Response Fields:**
+- `stationName` (String): 최종 매칭된 측정소명
+- `sidoName` (String | null): 시/도명
+- `pm25_value`, `pm10_value`, `o3_value`, `no2_value`, `co_value`, `so2_value` (Number): 오염물질 수치
+- `pm25_grade`, `pm10_grade`, `o3_grade`, `no2_grade`, `co_grade`, `so2_grade` (String): 4단계 등급(`좋음/보통/나쁨/매우나쁨`)
+- `temp` (Number): 기온
+- `humidity` (Number): 습도
+- `dataTime` (String | null): 관측 시각
+
+**Status Codes:**
+- `200`: 정상 반환
+- `404`: 해당 측정소 데이터 없음
+- `500`: 내부 오류
+
+동작 우선순위:
+1. MongoDB `air_quality_data` 최신 데이터
+2. Air Korea fallback API
+3. Mock data fallback
+
+---
+
+## 3. Clothing Recommendation (Rule-based)
+현재 버전은 기온/습도 규칙 기반 옷차림 추천을 제공합니다.
+
+- **Endpoint:** `POST /api/clothing-recommendation`
+- **Content-Type:** `application/json`
+
+### Request Body
+| Field | Type | Description |
+|-------|------|-------------|
+| `temperature` | Number | 기온 (기본값: `22.0`) |
+| `humidity` | Number | 습도 (기본값: `45.0`) |
+
+### Example Request
+```bash
+curl -X POST "https://<your-domain>/api/clothing-recommendation" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "temperature": 26.1,
+    "humidity": 71
+  }'
+```
+
+### Example Response
+```json
+{
+  "summary": "다소 덥고 습한 날씨예요. 통풍이 잘되는 옷차림을 추천해요.",
+  "recommendation": "반팔 + 얇은 바람막이 + 통풍 좋은 긴바지를 추천해요.",
+  "tips": [
+    "바깥 활동 후 겉옷을 바로 털고 손/얼굴을 씻어주세요.",
+    "땀을 빨리 말리는 소재를 선택하세요."
+  ],
+  "comfortLevel": "WARM",
+  "temperature": 26.1,
+  "humidity": 71.0,
+  "source": "rule-based-v1"
+}
+```
+
+동작:
+- 현재 구현은 규칙 기반으로만 동작합니다.
+- 서버 오류 시 `source: "fallback"` 응답으로 대체됩니다.
+
+---
+
+## 4. Ingest PDF (Single File)
 Uploads a single PDF file to the vector database.
 
 - **Endpoint:** `POST /api/ingest/pdf`
@@ -102,7 +234,7 @@ curl -X POST -F "file=@/path/to/paper.pdf" "https://<your-domain>/api/ingest/pdf
 
 ---
 
-## 3. OpenAI Responses Proxy (Server-to-Server)
+## 5. OpenAI Responses Proxy (Server-to-Server)
 OpenAI Responses API 호출을 이 서버가 중계합니다.
 
 - **Health Endpoint:** `GET /api/openai/v1/health`
