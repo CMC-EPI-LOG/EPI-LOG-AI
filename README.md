@@ -79,7 +79,7 @@ sequenceDiagram
   - `medical_guidelines`: 임베딩 포함 가이드라인/문서
   - `daily_air_quality`: 날짜별 대기질 데이터
   - `rag_cache`: 사용자/대기질 기반 캐시
-- **결정 로직**: PM2.5, O3 등급 기반으로 `ok/caution/warning` 산출
+- **결정 로직**: PM2.5/PM10/O3 및 보정 로직을 반영한 4단계(`좋음/보통/나쁨/매우나쁨`) 등급으로 CSV 80행 매트릭스 매핑
 - **응답 구성**: 결정 텍스트 + 행동 지침(템플릿) + LLM reason
 - **폴백 로직**: 캐시 실패, 벡터 검색 실패, LLM 실패에 대한 안전 장치 포함
 
@@ -135,17 +135,84 @@ sequenceDiagram
 - **Request Body**
   - `stationName` (String): 대기질 측정소명
   - `userProfile` (Object)
-    - `ageGroup`: `"infant" | "elementary_low" | "elementary_high" | "teen"`
-    - `condition`: `"asthma" | "rhinitis" | "none" | "etc"`
+    - `ageGroup`: `"infant" | "toddler" | "elementary_low" | "elementary_high" | "teen_adult"`
+    - `condition`: `"general" | "rhinitis" | "asthma" | "atopy"`
 - **Response**
   - `decision`: String (결정 문구)
-  - `reason`: String (LLM 생성 근거)
+  - `csv_reason`: String | null (CSV `이유` 컬럼)
+  - `reason`: String | null (`detail_answer`와 동일한 호환 필드)
+  - `three_reason`: String[] (3개 요약 문장)
+  - `detail_answer`: String (상세 설명)
   - `actionItems`: String[] (행동 지침)
   - `references`: String[] (가이드라인 출처)
+  - `pm25_value`, `pm10_value`, `o3_value`, `no2_value`: Number (실행 시점에 포함될 수 있음)
 - **Error**
   - `500`: 내부 오류 (결정/근거 생성 실패)
 
-### 3) Ingest PDF (Single File)
+CSV 컬럼 반환 규칙:
+- `메인문구` -> `decision`
+- `이유` -> `csv_reason`
+- `행동1~3` -> `actionItems`
+- `대기등급`, `연령대`, `질환군`은 응답에 직접 반환하지 않음
+
+### 3) Get Air Quality
+
+- **GET** `/api/air-quality`
+- **Query Parameters**
+  - `stationName` (String, required): 측정소/지역명
+- **Response**
+  - `stationName`: String
+  - `sidoName`: String | null
+  - `pm25_value`, `pm10_value`, `o3_value`, `no2_value`, `co_value`, `so2_value`: Number
+  - `pm25_grade`, `pm10_grade`, `o3_grade`, `no2_grade`, `co_grade`, `so2_grade`: String (`좋음/보통/나쁨/매우나쁨`)
+  - `temp`: Number
+  - `humidity`: Number
+  - `dataTime`: String | null
+- **Status**
+  - `200`: 정상 반환
+  - `404`: 해당 측정소 데이터 없음
+  - `500`: 내부 오류
+- **동작 우선순위**
+  1. MongoDB `air_quality_data`
+  2. Air Korea fallback API
+  3. Mock data fallback
+
+예시:
+```bash
+curl -G "https://<your-domain>/api/air-quality" \
+  --data-urlencode "stationName=종로구"
+```
+
+### 4) Clothing Recommendation (Rule-based)
+
+- **POST** `/api/clothing-recommendation`
+- **Content-Type**: `application/json`
+- **Request Body**
+  - `temperature` (Number, optional, default `22.0`)
+  - `humidity` (Number, optional, default `45.0`)
+- **Response**
+  - `summary`: String
+  - `recommendation`: String
+  - `tips`: String[]
+  - `comfortLevel`: `"FREEZING" | "COLD" | "CHILLY" | "MILD" | "WARM" | "HOT"`
+  - `temperature`: Number
+  - `humidity`: Number
+  - `source`: String (`rule-based-v1` 또는 오류 시 `fallback`)
+- **동작 규칙**
+  - 현재 구현은 규칙 기반 추천을 반환
+  - 서버 오류 시 fallback 응답 반환
+
+예시:
+```bash
+curl -X POST "https://<your-domain>/api/clothing-recommendation" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "temperature": 27.3,
+    "humidity": 68
+  }'
+```
+
+### 5) Ingest PDF (Single File)
 
 - **POST** `/api/ingest/pdf`
 - **Content-Type**: `multipart/form-data`
@@ -159,7 +226,7 @@ sequenceDiagram
   - `400`: PDF가 아닌 파일 업로드
   - `500`: 처리 실패
 
-### 4) OpenAI Responses Proxy (Server-to-Server)
+### 6) OpenAI Responses Proxy (Server-to-Server)
 
 - **GET** `/api/openai/v1/health`
 - **Response**

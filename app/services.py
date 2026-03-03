@@ -435,6 +435,205 @@ def get_clothing_recommendation(temp: Any, humidity: Any) -> Dict[str, Any]:
     }
 
 
+AGE_GROUP_LABELS = {
+    "infant": "영아(0-2세)",
+    "toddler": "유아(3-6세)",
+    "elementary_low": "초등저(7-9세)",
+    "elementary_high": "초등고(10-12세)",
+    "teen_adult": "청소년/성인",
+}
+
+CONDITION_LABELS = {
+    "general": "일반",
+    "rhinitis": "비염",
+    "asthma": "천식",
+    "atopy": "아토피",
+}
+
+VALID_COMFORT_LEVELS = {"FREEZING", "COLD", "CHILLY", "MILD", "WARM", "HOT"}
+
+
+def _normalize_condition_key(condition: Any) -> str:
+    if condition is None:
+        return "general"
+    raw = str(condition).strip().lower()
+    if not raw:
+        return "general"
+
+    alias_map = {
+        "general": {"general", "일반", "none", "없음", "healthy", "normal", "건강함"},
+        "rhinitis": {"rhinitis", "비염", "allergic_rhinitis", "allergy"},
+        "asthma": {"asthma", "천식"},
+        "atopy": {"atopy", "아토피", "eczema"},
+    }
+    for key, aliases in alias_map.items():
+        if raw in aliases:
+            return key
+
+    if "비염" in raw or "rhinitis" in raw:
+        return "rhinitis"
+    if "천식" in raw or "asthma" in raw:
+        return "asthma"
+    if "아토피" in raw or "atopy" in raw or "eczema" in raw:
+        return "atopy"
+    return "general"
+
+
+def _normalize_grade_label(value: Any, default: Optional[str] = "보통") -> Optional[str]:
+    if value is None:
+        return default
+    raw = str(value).strip()
+    if not raw:
+        return default
+
+    compact = raw.lower().replace(" ", "").replace("-", "").replace("_", "")
+    alias_map = {
+        "1": "좋음",
+        "good": "좋음",
+        "좋음": "좋음",
+        "2": "보통",
+        "moderate": "보통",
+        "normal": "보통",
+        "보통": "보통",
+        "3": "나쁨",
+        "bad": "나쁨",
+        "poor": "나쁨",
+        "나쁨": "나쁨",
+        "4": "매우나쁨",
+        "verybad": "매우나쁨",
+        "verypoor": "매우나쁨",
+        "매우나쁨": "매우나쁨",
+    }
+    return alias_map.get(compact, default)
+
+
+def _resolve_air_grades(air_quality: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    payload = air_quality or {}
+    overall = _normalize_grade_label(payload.get("grade"), default=None)
+    pm25 = _normalize_grade_label(payload.get("pm25Grade"), default=None)
+    pm10 = _normalize_grade_label(payload.get("pm10Grade"), default=None)
+    o3 = _normalize_grade_label(payload.get("o3Grade"), default=None)
+
+    if overall is None:
+        known_grades = [g for g in [pm25, pm10, o3] if g]
+        if known_grades:
+            overall = max(known_grades, key=lambda grade: GRADE_MAP.get(grade, 2))
+        else:
+            overall = "보통"
+
+    return {
+        "overall": overall,
+        "pm25": pm25 or overall,
+        "pm10": pm10 or overall,
+        "o3": o3 or overall,
+    }
+
+
+def get_ai_clothing_recommendation(
+    temp: Any,
+    humidity: Any,
+    user_profile: Optional[Dict[str, Any]] = None,
+    air_quality: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    fallback_result = get_clothing_recommendation(temp, humidity)
+    user_profile = user_profile or {}
+    air_quality = air_quality or {}
+
+    has_profile_input = bool(user_profile.get("ageGroup")) or bool(user_profile.get("condition"))
+    has_air_input = any(air_quality.get(key) for key in ("grade", "pm25Grade", "pm10Grade", "o3Grade"))
+    if not (has_profile_input and has_air_input):
+        return fallback_result
+
+    if not openai_client:
+        fallback_no_ai = dict(fallback_result)
+        fallback_no_ai["source"] = "rule-based-fallback-no-openai"
+        return fallback_no_ai
+
+    age_group_key = _normalize_age_group(user_profile.get("ageGroup"))
+    condition_key = _normalize_condition_key(user_profile.get("condition"))
+    age_group_label = AGE_GROUP_LABELS.get(age_group_key, AGE_GROUP_LABELS["elementary_high"])
+    condition_label = CONDITION_LABELS.get(condition_key, CONDITION_LABELS["general"])
+    air_grades = _resolve_air_grades(air_quality)
+
+    system_prompt = """
+    너는 날씨/대기질/연령/기저질환을 함께 반영해 실용적인 옷차림을 추천하는 AI 스타일 코치다.
+    출력은 반드시 JSON 객체 하나만 반환한다.
+    필수 키:
+    - summary: 한 문장 요약
+    - recommendation: 핵심 착장 한 문장
+    - tips: 1~3개의 짧은 실천 팁 배열
+    - comfortLevel: FREEZING|COLD|CHILLY|MILD|WARM|HOT 중 하나
+    규칙:
+    - 입력 수치와 모순된 추천을 하지 말 것
+    - 과도한 의료 지시는 피할 것
+    - 한국어로 간결하고 즉시 실행 가능하게 작성할 것
+    """
+
+    user_prompt = f"""
+    [입력]
+    - 기온: {fallback_result.get("temperature")}°C
+    - 습도: {fallback_result.get("humidity")}%
+    - 연령대: {age_group_label}
+    - 기저질환: {condition_label}
+    - 대기등급(종합): {air_grades["overall"]}
+    - PM2.5 등급: {air_grades["pm25"]}
+    - PM10 등급: {air_grades["pm10"]}
+    - 오존(O3) 등급: {air_grades["o3"]}
+
+    [규칙기반 참고안]
+    - summary: {fallback_result.get("summary")}
+    - recommendation: {fallback_result.get("recommendation")}
+    - tips: {fallback_result.get("tips")}
+    - comfortLevel: {fallback_result.get("comfortLevel")}
+
+    위 정보를 바탕으로 개인화된 옷차림을 생성해줘.
+    """
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.7
+        )
+        content = response.choices[0].message.content or "{}"
+        llm_result = json.loads(content)
+
+        summary = str(llm_result.get("summary", "")).strip()
+        recommendation = str(llm_result.get("recommendation", "")).strip()
+        raw_tips = llm_result.get("tips")
+        tips = []
+        if isinstance(raw_tips, list):
+            for item in raw_tips:
+                text = str(item).strip()
+                if text:
+                    tips.append(text)
+        comfort_level = str(llm_result.get("comfortLevel", "")).strip().upper()
+
+        if not summary or not recommendation or not tips:
+            raise ValueError("LLM response missing required clothing fields")
+        if comfort_level not in VALID_COMFORT_LEVELS:
+            comfort_level = fallback_result.get("comfortLevel", "MILD")
+
+        return {
+            "summary": summary,
+            "recommendation": recommendation,
+            "tips": tips[:3],
+            "comfortLevel": comfort_level,
+            "temperature": fallback_result.get("temperature"),
+            "humidity": fallback_result.get("humidity"),
+            "source": "ai-dynamic-v1"
+        }
+    except Exception as e:
+        print(f"Error generating AI clothing recommendation: {e}")
+        fallback_error = dict(fallback_result)
+        fallback_error["source"] = "rule-based-fallback-on-error"
+        return fallback_error
+
+
 CSV_AGE_MAP = {
     "영아(0-2세)": "infant",
     "유아(3-6세)": "toddler",
