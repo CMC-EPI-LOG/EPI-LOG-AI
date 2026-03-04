@@ -591,7 +591,7 @@ def get_ai_clothing_recommendation(
 
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-nano",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -1610,7 +1610,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-nano",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
