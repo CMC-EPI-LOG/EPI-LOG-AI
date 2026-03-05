@@ -1805,6 +1805,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
+            timeout=max(ADVICE_LLM_TIMEOUT_MS, 1) / 1000,
         )
 
         timings["llm_ms"] = round((perf_counter() - llm_started_at) * 1000, 1)
