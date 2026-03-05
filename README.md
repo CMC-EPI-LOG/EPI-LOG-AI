@@ -261,6 +261,8 @@ curl -X POST "https://<your-domain>/api/openai/v1/responses" \
 - `MONGODB_URI` (or `MONGO_URI`)
 - `VOYAGE_API_KEY`
 - `OPENAI_API_KEY`
+- `ADVICE_VECTOR_SEARCH_ENABLED` (기본: `0`, `1`로 설정 시 Voyage 벡터 검색 활성화)
+- `ADVICE_LLM_TIMEOUT_MS` (기본: `2200`)
 - `OPENAI_PROXY_TOKEN` (권장, 프록시 보호용)
 - `OPENAI_UPSTREAM_BASE_URL` (기본: `https://api.openai.com/v1`)
 - `OPENAI_PROXY_TIMEOUT_SECONDS` (기본: `300`)
