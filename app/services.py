@@ -1,6 +1,7 @@
 import os
 import json
 import csv
+import asyncio
 from datetime import datetime, timedelta
 from time import perf_counter
 from zoneinfo import ZoneInfo
@@ -31,6 +32,13 @@ def _infer_db_name_from_uri(uri: Optional[str]) -> Optional[str]:
         return db_name or None
     except Exception:
         return None
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 DB_NAME = os.getenv("MONGO_DB_NAME", "epilog_db")
@@ -1039,6 +1047,17 @@ except Exception as e:
     print(f"Error initializing OpenAI client: {e}")
     openai_client = None
 
+ADVICE_VECTOR_SEARCH_ENABLED = _env_flag("ADVICE_VECTOR_SEARCH_ENABLED", False)
+_vector_search_enabled = bool(ADVICE_VECTOR_SEARCH_ENABLED and vo_client and VOYAGE_API_KEY)
+_vector_search_skip_notice_emitted = False
+
+if ADVICE_VECTOR_SEARCH_ENABLED and not VOYAGE_API_KEY:
+    print("⚠️ Vector search requested but VOYAGE_API_KEY is missing. Running without vector search.")
+elif ADVICE_VECTOR_SEARCH_ENABLED and not vo_client:
+    print("⚠️ Vector search requested but Voyage client is unavailable. Running without vector search.")
+elif not ADVICE_VECTOR_SEARCH_ENABLED:
+    print("ℹ️ Vector search disabled by config (ADVICE_VECTOR_SEARCH_ENABLED=0).")
+
 async def get_air_quality_from_mongodb(station_name: str) -> Optional[Dict[str, Any]]:
     """
     Fetch latest air quality data from MongoDB air_quality_data collection.
@@ -1346,6 +1365,12 @@ _cache_ttl_index_ready = False
 ADVICE_DETAIL_MAX_CHARS = int(os.getenv("ADVICE_DETAIL_MAX_CHARS", "520"))
 ADVICE_CONTEXT_DOC_LIMIT = int(os.getenv("ADVICE_CONTEXT_DOC_LIMIT", "2"))
 ADVICE_CONTEXT_DOC_MAX_CHARS = int(os.getenv("ADVICE_CONTEXT_DOC_MAX_CHARS", "220"))
+ADVICE_AIR_FETCH_TIMEOUT_MS = int(os.getenv("ADVICE_AIR_FETCH_TIMEOUT_MS", "1500"))
+ADVICE_CACHE_READ_TIMEOUT_MS = int(os.getenv("ADVICE_CACHE_READ_TIMEOUT_MS", "450"))
+ADVICE_VECTOR_EMBED_TIMEOUT_MS = int(os.getenv("ADVICE_VECTOR_EMBED_TIMEOUT_MS", "900"))
+ADVICE_VECTOR_QUERY_TIMEOUT_MS = int(os.getenv("ADVICE_VECTOR_QUERY_TIMEOUT_MS", "700"))
+ADVICE_LLM_TIMEOUT_MS = int(os.getenv("ADVICE_LLM_TIMEOUT_MS", "2200"))
+ADVICE_CACHE_WRITE_TIMEOUT_MS = int(os.getenv("ADVICE_CACHE_WRITE_TIMEOUT_MS", "450"))
 
 
 def _normalize_whitespace(value: Any) -> str:
@@ -1389,7 +1414,14 @@ def _log_advice_timing(
     timings: Dict[str, float],
     stage: str = "ok",
 ) -> None:
-    order = ["air_fetch_ms", "cache_check_ms", "vector_search_ms", "llm_ms", "total_ms"]
+    order = [
+        "air_fetch_ms",
+        "cache_check_ms",
+        "vector_search_ms",
+        "llm_ms",
+        "cache_write_ms",
+        "total_ms",
+    ]
     chunks = [
         f"{key}={timings[key]:.1f}ms"
         for key in order
@@ -1398,6 +1430,23 @@ def _log_advice_timing(
     print(
         f"⏱️ Advice timing station={station_name} stage={stage} "
         f"cache_hit={cache_hit} {' '.join(chunks)}"
+    )
+
+
+def _is_timeout_error(error: Exception) -> bool:
+    return isinstance(error, asyncio.TimeoutError)
+
+
+def _is_voyage_forbidden_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return "forbidden" in text or "403" in text
+
+
+async def _run_blocking_with_timeout(timeout_ms: int, func, *args, **kwargs):
+    timeout_s = max(timeout_ms, 1) / 1000
+    return await asyncio.wait_for(
+        asyncio.to_thread(func, *args, **kwargs),
+        timeout=timeout_s,
     )
 
 
@@ -1508,7 +1557,16 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
 
     # Step A: Get Air Quality
     air_fetch_started_at = perf_counter()
-    air_data = await get_air_quality(station_name)
+    try:
+        air_data = await asyncio.wait_for(
+            get_air_quality(station_name),
+            timeout=max(ADVICE_AIR_FETCH_TIMEOUT_MS, 1) / 1000,
+        )
+    except asyncio.TimeoutError:
+        air_data = None
+        print(
+            f"⚠️ Air fetch timed out: station={station_name} timeout_ms={ADVICE_AIR_FETCH_TIMEOUT_MS}"
+        )
     timings["air_fetch_ms"] = round((perf_counter() - air_fetch_started_at) * 1000, 1)
     if not air_data:
         raise ValueError(f"No air quality data found for station: {station_name}")
@@ -1532,9 +1590,15 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     cache_check_started_at = perf_counter()
     if db is not None:
         try:
-            await _ensure_cache_ttl_index()
+            await asyncio.wait_for(
+                _ensure_cache_ttl_index(),
+                timeout=max(ADVICE_CACHE_READ_TIMEOUT_MS, 1) / 1000,
+            )
             cache_key = _generate_cache_key(air_data, user_profile)
-            cached_entry = await db[CACHE_COLLECTION].find_one({"_id": cache_key})
+            cached_entry = await asyncio.wait_for(
+                db[CACHE_COLLECTION].find_one({"_id": cache_key}),
+                timeout=max(ADVICE_CACHE_READ_TIMEOUT_MS, 1) / 1000,
+            )
             
             if cached_entry:
                 cache_hit = True
@@ -1548,7 +1612,12 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
                 _log_advice_timing(station_name, cache_hit=True, timings=timings, stage="cache_hit")
                 return normalized_cached_data
         except Exception as e:
-            print(f"⚠️ Cache check failed: {e}")
+            if _is_timeout_error(e):
+                print(
+                    f"⚠️ Cache check timed out: station={station_name} timeout_ms={ADVICE_CACHE_READ_TIMEOUT_MS}"
+                )
+            else:
+                print(f"⚠️ Cache check failed: {e}")
     timings["cache_check_ms"] = round((perf_counter() - cache_check_started_at) * 1000, 1)
 
     # Determine main issue for search (using corrected grades)
@@ -1567,10 +1636,18 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     # Step C: Vector Search
     vector_search_started_at = perf_counter()
     relevant_docs = []
-    if vo_client and db is not None:
+    global _vector_search_enabled
+    global _vector_search_skip_notice_emitted
+    if vo_client and db is not None and _vector_search_enabled:
         try:
             # 1. Primary Search
-            embed_result = vo_client.embed([search_query], model="voyage-3-large", input_type="query")
+            embed_result = await _run_blocking_with_timeout(
+                ADVICE_VECTOR_EMBED_TIMEOUT_MS,
+                vo_client.embed,
+                [search_query],
+                model="voyage-3-large",
+                input_type="query",
+            )
             query_vector = embed_result.embeddings[0]
             
             pipeline = [
@@ -1596,23 +1673,47 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
             ]
             
             cursor = db[GUIDELINES_COLLECTION].aggregate(pipeline)
-            relevant_docs = await cursor.to_list(length=3)
+            relevant_docs = await asyncio.wait_for(
+                cursor.to_list(length=3),
+                timeout=max(ADVICE_VECTOR_QUERY_TIMEOUT_MS, 1) / 1000,
+            )
             
             # 2. Fallback Search (If no docs found)
             if not relevant_docs:
                 print("⚠️ Primary search returned no results. Attempting fallback (General) search.")
                 fallback_query = f"{main_condition} 행동 요령"
-                embed_result_fb = vo_client.embed([fallback_query], model="voyage-3-large", input_type="query")
+                embed_result_fb = await _run_blocking_with_timeout(
+                    ADVICE_VECTOR_EMBED_TIMEOUT_MS,
+                    vo_client.embed,
+                    [fallback_query],
+                    model="voyage-3-large",
+                    input_type="query",
+                )
                 query_vector_fb = embed_result_fb.embeddings[0]
                 
                 pipeline[0]["$vectorSearch"]["queryVector"] = query_vector_fb
                 
                 cursor = db[GUIDELINES_COLLECTION].aggregate(pipeline)
-                relevant_docs = await cursor.to_list(length=3)
-                
+                relevant_docs = await asyncio.wait_for(
+                    cursor.to_list(length=3),
+                    timeout=max(ADVICE_VECTOR_QUERY_TIMEOUT_MS, 1) / 1000,
+                )
+
         except Exception as e:
-            print(f"Error during vector search: {e}")
+            if _is_voyage_forbidden_error(e):
+                _vector_search_enabled = False
+                print(f"⚠️ Vector search disabled due to forbidden error: {e}")
+            elif _is_timeout_error(e):
+                print(
+                    f"⚠️ Vector search timed out: station={station_name} "
+                    f"embed_timeout_ms={ADVICE_VECTOR_EMBED_TIMEOUT_MS} query_timeout_ms={ADVICE_VECTOR_QUERY_TIMEOUT_MS}"
+                )
+            else:
+                print(f"Error during vector search: {e}")
             pass
+    elif vo_client and db is not None and not _vector_search_enabled and not _vector_search_skip_notice_emitted:
+        _vector_search_skip_notice_emitted = True
+        print("⚠️ Vector search skipped (disabled)")
     timings["vector_search_ms"] = round((perf_counter() - vector_search_started_at) * 1000, 1)
 
     # Step D: LLM Generation
@@ -1695,7 +1796,9 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
 
     llm_started_at = perf_counter()
     try:
-        response = openai_client.chat.completions.create(
+        response = await _run_blocking_with_timeout(
+            ADVICE_LLM_TIMEOUT_MS,
+            openai_client.chat.completions.create,
             model="gpt-5-nano",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -1757,15 +1860,26 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         
         # [Step F] Save to Cache
         if db is not None and cache_key:
+            cache_write_started_at = perf_counter()
             try:
-                await db[CACHE_COLLECTION].update_one(
-                    {"_id": cache_key},
-                    {"$set": {"data": final_result, "created_at": datetime.now(KST_TZ)}},
-                    upsert=True
+                await asyncio.wait_for(
+                    db[CACHE_COLLECTION].update_one(
+                        {"_id": cache_key},
+                        {"$set": {"data": final_result, "created_at": datetime.now(KST_TZ)}},
+                        upsert=True
+                    ),
+                    timeout=max(ADVICE_CACHE_WRITE_TIMEOUT_MS, 1) / 1000,
                 )
                 print(f"💾 Saved to cache: {cache_key}")
             except Exception as e:
-                print(f"Error saving to cache: {e}")
+                if _is_timeout_error(e):
+                    print(
+                        f"⚠️ Cache write timed out: key={cache_key} timeout_ms={ADVICE_CACHE_WRITE_TIMEOUT_MS}"
+                    )
+                else:
+                    print(f"Error saving to cache: {e}")
+            finally:
+                timings["cache_write_ms"] = round((perf_counter() - cache_write_started_at) * 1000, 1)
 
         timings["total_ms"] = round((perf_counter() - request_started_at) * 1000, 1)
         _log_advice_timing(station_name, cache_hit=cache_hit, timings=timings, stage="ok")
@@ -1775,7 +1889,10 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         timings["llm_ms"] = round((perf_counter() - llm_started_at) * 1000, 1)
         timings["total_ms"] = round((perf_counter() - request_started_at) * 1000, 1)
         _log_advice_timing(station_name, cache_hit=cache_hit, timings=timings, stage="llm_error")
-        print(f"Error calling OpenAI: {e}")
+        if _is_timeout_error(e):
+            print(f"⚠️ LLM call timed out: station={station_name} timeout_ms={ADVICE_LLM_TIMEOUT_MS}")
+        else:
+            print(f"Error calling OpenAI: {e}")
         # Fallback even if LLM fails, we satisfy the deterministic requirement
         return _enforce_advice_response_limits({
             "decision": decision_text,
