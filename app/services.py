@@ -41,6 +41,25 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _bounded_int_env(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except Exception:
+        print(f"⚠️ Invalid int env {name}={raw!r}; using default={default}")
+        return default
+
+    if value < min_value:
+        print(f"⚠️ {name}={value} is below min={min_value}; clamping to {min_value}")
+        return min_value
+    if value > max_value:
+        print(f"⚠️ {name}={value} exceeds max={max_value}; clamping to {max_value}")
+        return max_value
+    return value
+
+
 DB_NAME = os.getenv("MONGO_DB_NAME", "epilog_db")
 AIR_QUALITY_DB_NAME = os.getenv("AIR_QUALITY_DB_NAME") or _infer_db_name_from_uri(MONGO_URI) or DB_NAME
 GUIDELINES_COLLECTION = "medical_guidelines"
@@ -1362,15 +1381,60 @@ async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
 CACHE_COLLECTION = "rag_cache"
 CACHE_TTL_SECONDS = 60 * 60 * 30  # 30 hours
 _cache_ttl_index_ready = False
-ADVICE_DETAIL_MAX_CHARS = int(os.getenv("ADVICE_DETAIL_MAX_CHARS", "520"))
-ADVICE_CONTEXT_DOC_LIMIT = int(os.getenv("ADVICE_CONTEXT_DOC_LIMIT", "2"))
-ADVICE_CONTEXT_DOC_MAX_CHARS = int(os.getenv("ADVICE_CONTEXT_DOC_MAX_CHARS", "220"))
-ADVICE_AIR_FETCH_TIMEOUT_MS = int(os.getenv("ADVICE_AIR_FETCH_TIMEOUT_MS", "1500"))
-ADVICE_CACHE_READ_TIMEOUT_MS = int(os.getenv("ADVICE_CACHE_READ_TIMEOUT_MS", "450"))
-ADVICE_VECTOR_EMBED_TIMEOUT_MS = int(os.getenv("ADVICE_VECTOR_EMBED_TIMEOUT_MS", "900"))
-ADVICE_VECTOR_QUERY_TIMEOUT_MS = int(os.getenv("ADVICE_VECTOR_QUERY_TIMEOUT_MS", "700"))
-ADVICE_LLM_TIMEOUT_MS = int(os.getenv("ADVICE_LLM_TIMEOUT_MS", "2200"))
-ADVICE_CACHE_WRITE_TIMEOUT_MS = int(os.getenv("ADVICE_CACHE_WRITE_TIMEOUT_MS", "450"))
+ADVICE_DETAIL_MAX_CHARS = _bounded_int_env(
+    "ADVICE_DETAIL_MAX_CHARS",
+    520,
+    min_value=120,
+    max_value=1200,
+)
+ADVICE_CONTEXT_DOC_LIMIT = _bounded_int_env(
+    "ADVICE_CONTEXT_DOC_LIMIT",
+    2,
+    min_value=1,
+    max_value=4,
+)
+ADVICE_CONTEXT_DOC_MAX_CHARS = _bounded_int_env(
+    "ADVICE_CONTEXT_DOC_MAX_CHARS",
+    220,
+    min_value=80,
+    max_value=500,
+)
+ADVICE_AIR_FETCH_TIMEOUT_MS = _bounded_int_env(
+    "ADVICE_AIR_FETCH_TIMEOUT_MS",
+    1500,
+    min_value=300,
+    max_value=5000,
+)
+ADVICE_CACHE_READ_TIMEOUT_MS = _bounded_int_env(
+    "ADVICE_CACHE_READ_TIMEOUT_MS",
+    450,
+    min_value=150,
+    max_value=1800,
+)
+ADVICE_VECTOR_EMBED_TIMEOUT_MS = _bounded_int_env(
+    "ADVICE_VECTOR_EMBED_TIMEOUT_MS",
+    900,
+    min_value=250,
+    max_value=2500,
+)
+ADVICE_VECTOR_QUERY_TIMEOUT_MS = _bounded_int_env(
+    "ADVICE_VECTOR_QUERY_TIMEOUT_MS",
+    700,
+    min_value=200,
+    max_value=2200,
+)
+ADVICE_LLM_TIMEOUT_MS = _bounded_int_env(
+    "ADVICE_LLM_TIMEOUT_MS",
+    2200,
+    min_value=600,
+    max_value=4500,
+)
+ADVICE_CACHE_WRITE_TIMEOUT_MS = _bounded_int_env(
+    "ADVICE_CACHE_WRITE_TIMEOUT_MS",
+    450,
+    min_value=150,
+    max_value=1800,
+)
 
 
 def _normalize_whitespace(value: Any) -> str:

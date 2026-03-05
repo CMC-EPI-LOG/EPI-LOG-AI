@@ -263,6 +263,13 @@ curl -X POST "https://<your-domain>/api/openai/v1/responses" \
 - `OPENAI_API_KEY`
 - `ADVICE_VECTOR_SEARCH_ENABLED` (기본: `0`, `1`로 설정 시 Voyage 벡터 검색 활성화)
 - `ADVICE_LLM_TIMEOUT_MS` (기본: `2200`)
+- `ADVICE_*_TIMEOUT_MS` 계열은 코드에서 상/하한 클램프가 적용됩니다.
+  - `ADVICE_AIR_FETCH_TIMEOUT_MS`: 300~5000
+  - `ADVICE_CACHE_READ_TIMEOUT_MS`: 150~1800
+  - `ADVICE_VECTOR_EMBED_TIMEOUT_MS`: 250~2500
+  - `ADVICE_VECTOR_QUERY_TIMEOUT_MS`: 200~2200
+  - `ADVICE_LLM_TIMEOUT_MS`: 600~4500
+  - `ADVICE_CACHE_WRITE_TIMEOUT_MS`: 150~1800
 - `OPENAI_PROXY_TOKEN` (권장, 프록시 보호용)
 - `OPENAI_UPSTREAM_BASE_URL` (기본: `https://api.openai.com/v1`)
 - `OPENAI_PROXY_TIMEOUT_SECONDS` (기본: `300`)
