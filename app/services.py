@@ -598,7 +598,6 @@ def get_ai_clothing_recommendation(
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=0.7
         )
         content = response.choices[0].message.content or "{}"
         llm_result = json.loads(content)
@@ -1402,6 +1401,38 @@ def _log_advice_timing(
     )
 
 
+def _enforce_advice_response_limits(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(payload or {})
+
+    raw_detail_answer = normalized.get("detail_answer", normalized.get("reason"))
+    detail_answer = _truncate_text(raw_detail_answer, ADVICE_DETAIL_MAX_CHARS)
+    if not detail_answer:
+        detail_answer = "정보를 불러오는 중 문제가 발생했습니다."
+    normalized["detail_answer"] = detail_answer
+    normalized["reason"] = detail_answer
+
+    raw_three_reason = normalized.get("three_reason")
+    three_reason: List[str] = []
+    if isinstance(raw_three_reason, list):
+        for item in raw_three_reason:
+            sentence = _truncate_text(item, 90)
+            if sentence:
+                three_reason.append(sentence)
+
+    fallback_three_reason = [
+        "대기질 정보를 분석하고 있습니다.",
+        "잠시 후 다시 확인해주세요.",
+        "문제가 지속되면 관리자에게 문의하세요."
+    ]
+    for fallback in fallback_three_reason:
+        if len(three_reason) >= 3:
+            break
+        three_reason.append(fallback)
+
+    normalized["three_reason"] = three_reason[:3]
+    return normalized
+
+
 def _normalize_cache_token(value: Any) -> str:
     if value is None:
         return "na"
@@ -1509,9 +1540,13 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
                 cache_hit = True
                 timings["cache_check_ms"] = round((perf_counter() - cache_check_started_at) * 1000, 1)
                 timings["total_ms"] = round((perf_counter() - request_started_at) * 1000, 1)
+                cached_data = cached_entry.get("data") if isinstance(cached_entry, dict) else {}
+                if not isinstance(cached_data, dict):
+                    cached_data = {}
+                normalized_cached_data = _enforce_advice_response_limits(cached_data)
                 print(f"✅ Cache Hit! Key: {cache_key}")
                 _log_advice_timing(station_name, cache_hit=True, timings=timings, stage="cache_hit")
-                return cached_entry["data"]
+                return normalized_cached_data
         except Exception as e:
             print(f"⚠️ Cache check failed: {e}")
     timings["cache_check_ms"] = round((perf_counter() - cache_check_started_at) * 1000, 1)
@@ -1699,7 +1734,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         three_reason = three_reason[:3]
         
         # Merge Results
-        final_result = {
+        final_result = _enforce_advice_response_limits({
             "decision": decision_text,
             "csv_reason": csv_reason,
             "reason": detail_answer,
@@ -1712,7 +1747,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
             "o3_value": air_data.get("o3_value"),
             "pm10_value": air_data.get("pm10_value"),
             "no2_value": air_data.get("no2_value")
-        }
+        })
 
         print(
             "🧾 Advice prompt stats "
@@ -1742,7 +1777,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         _log_advice_timing(station_name, cache_hit=cache_hit, timings=timings, stage="llm_error")
         print(f"Error calling OpenAI: {e}")
         # Fallback even if LLM fails, we satisfy the deterministic requirement
-        return {
+        return _enforce_advice_response_limits({
             "decision": decision_text,
             "csv_reason": csv_reason,
             "reason": "일시적인 오류로 상세 설명을 불러오지 못했습니다. 하지만 행동 지침은 위와 같이 준수해주세요.",
@@ -1759,7 +1794,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
             "o3_value": air_data.get("o3_value"),
             "pm10_value": air_data.get("pm10_value"),
             "no2_value": air_data.get("no2_value")
-        }
+        })
 
 async def ingest_pdf(file_content: bytes, filename: str) -> Dict[str, Any]:
     """
