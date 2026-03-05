@@ -2,6 +2,7 @@ import os
 import json
 import csv
 from datetime import datetime, timedelta
+from time import perf_counter
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional, Any
 from urllib.parse import urlparse
@@ -1343,6 +1344,63 @@ async def get_air_quality(station_name: str) -> Optional[Dict[str, Any]]:
 CACHE_COLLECTION = "rag_cache"
 CACHE_TTL_SECONDS = 60 * 60 * 30  # 30 hours
 _cache_ttl_index_ready = False
+ADVICE_DETAIL_MAX_CHARS = int(os.getenv("ADVICE_DETAIL_MAX_CHARS", "520"))
+ADVICE_CONTEXT_DOC_LIMIT = int(os.getenv("ADVICE_CONTEXT_DOC_LIMIT", "2"))
+ADVICE_CONTEXT_DOC_MAX_CHARS = int(os.getenv("ADVICE_CONTEXT_DOC_MAX_CHARS", "220"))
+
+
+def _normalize_whitespace(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).split())
+
+
+def _truncate_text(value: Any, max_chars: int) -> str:
+    text = _normalize_whitespace(value)
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+
+    candidate = text[:max_chars]
+    min_cut = int(max_chars * 0.6)
+    for sep in ["다. ", "요. ", ". ", "! ", "? "]:
+        cut = candidate.rfind(sep)
+        if cut >= min_cut:
+            return candidate[:cut + 2].rstrip()
+
+    return candidate.rstrip(" ,;:") + "…"
+
+
+def _build_compact_context_text(relevant_docs: List[Dict[str, Any]]) -> str:
+    if not relevant_docs:
+        return "관련 의학적 가이드라인 없음"
+
+    lines: List[str] = []
+    for doc in relevant_docs[:ADVICE_CONTEXT_DOC_LIMIT]:
+        source = _normalize_whitespace(doc.get("source", "가이드라인")) or "가이드라인"
+        text = _truncate_text(doc.get("text", ""), ADVICE_CONTEXT_DOC_MAX_CHARS)
+        if text:
+            lines.append(f"- [{source}] {text}")
+
+    return "\n".join(lines) if lines else "관련 의학적 가이드라인 없음"
+
+
+def _log_advice_timing(
+    station_name: str,
+    cache_hit: bool,
+    timings: Dict[str, float],
+    stage: str = "ok",
+) -> None:
+    order = ["air_fetch_ms", "cache_check_ms", "vector_search_ms", "llm_ms", "total_ms"]
+    chunks = [
+        f"{key}={timings[key]:.1f}ms"
+        for key in order
+        if key in timings and isinstance(timings[key], (int, float))
+    ]
+    print(
+        f"⏱️ Advice timing station={station_name} stage={stage} "
+        f"cache_hit={cache_hit} {' '.join(chunks)}"
+    )
+
 
 def _normalize_cache_token(value: Any) -> str:
     if value is None:
@@ -1413,8 +1471,14 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     """
     Main orchestration function with correction logic.
     """
+    request_started_at = perf_counter()
+    timings: Dict[str, float] = {}
+    cache_hit = False
+
     # Step A: Get Air Quality
+    air_fetch_started_at = perf_counter()
     air_data = await get_air_quality(station_name)
+    timings["air_fetch_ms"] = round((perf_counter() - air_fetch_started_at) * 1000, 1)
     if not air_data:
         raise ValueError(f"No air quality data found for station: {station_name}")
 
@@ -1434,6 +1498,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
 
     cache_key = ""
     # [Step A.1] Check Cache
+    cache_check_started_at = perf_counter()
     if db is not None:
         try:
             await _ensure_cache_ttl_index()
@@ -1441,10 +1506,15 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
             cached_entry = await db[CACHE_COLLECTION].find_one({"_id": cache_key})
             
             if cached_entry:
+                cache_hit = True
+                timings["cache_check_ms"] = round((perf_counter() - cache_check_started_at) * 1000, 1)
+                timings["total_ms"] = round((perf_counter() - request_started_at) * 1000, 1)
                 print(f"✅ Cache Hit! Key: {cache_key}")
+                _log_advice_timing(station_name, cache_hit=True, timings=timings, stage="cache_hit")
                 return cached_entry["data"]
         except Exception as e:
             print(f"⚠️ Cache check failed: {e}")
+    timings["cache_check_ms"] = round((perf_counter() - cache_check_started_at) * 1000, 1)
 
     # Determine main issue for search (using corrected grades)
     main_condition = "보통"
@@ -1460,6 +1530,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     print(f"Generated Search Query (Primary): {search_query}")
 
     # Step C: Vector Search
+    vector_search_started_at = perf_counter()
     relevant_docs = []
     if vo_client and db is not None:
         try:
@@ -1507,9 +1578,16 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         except Exception as e:
             print(f"Error during vector search: {e}")
             pass
+    timings["vector_search_ms"] = round((perf_counter() - vector_search_started_at) * 1000, 1)
 
     # Step D: LLM Generation
+    context_text = _build_compact_context_text(relevant_docs)
+    context_doc_count = min(len(relevant_docs), ADVICE_CONTEXT_DOC_LIMIT)
+    context_chars = len(context_text)
+
     if not openai_client:
+         timings["total_ms"] = round((perf_counter() - request_started_at) * 1000, 1)
+         _log_advice_timing(station_name, cache_hit=cache_hit, timings=timings, stage="no_openai_client")
          return {
             "decision": "Error",
             "three_reason": [
@@ -1557,57 +1635,30 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     if GRADE_MAP.get(pm25_corrected, 1) >= 3 and GRADE_MAP.get(o3_corrected, 1) >= 3:
         decision_text += " (미세먼지와 오존 둘 다 높아요!)"
 
-    # Prepare Context
-    context_text = "\n".join([f"- [출처: {doc.get('source', '가이드라인')}] {doc.get('text', '')}" for doc in relevant_docs]) if relevant_docs else "관련 의학적 가이드라인을 찾을 수 없습니다."
-    
-    system_prompt = """
-    너는 복잡한 대기질 논문과 데이터를 학부모가 이해하기 쉽게 설명해주는 AI 비서다.
-    
-    [역할 및 출력 제약]
-    1. 'decision'과 'actionItems'는 이미 시스템에서 계산되었습니다. 당신은 이 결정이 내려진 이유를 학부모가 이해하기 쉽게 설명해야 합니다.
-    2. 반드시 다음 두 가지를 JSON 형식으로 출력하세요:
-       - "three_reason": 정확히 3개의 짧은 요약 문장 배열 (각 문장은 한 줄로, 핵심 키워드는 **double asterisks**로 감싸기)
-       - "detail_answer": 상세한 의학적/환경적 설명 (기존의 긴 설명)
-    
-    3. **키워드 하이라이팅 규칙**:
-       - 질환명 (예: **천식**, **비염**, **아토피**)
-       - 대기질 등급 (예: **좋음**, **나쁨**, **매우나쁨**)
-       - 행동 요령 (예: **실외 활동**, **마스크 착용**, **환기**)
-       - 중요한 수치나 시간대 (예: **35**, **오후 2~5시**)
-    
-    4. **톤앤매너**: 친절하지만 명확하고 단호하게. 학부모가 즉시 행동할 수 있도록 구체적으로 작성하세요.
-    
-    5. 보정 로직이 적용된 경우(예: 습도, 온도로 인한 등급 격상) 그 이유를 three_reason이나 detail_answer에 포함하세요.
-    
-    6. 제공된 [의학적 가이드라인] 내용을 최우선으로 반영하여 설명하세요.
-    """
-    
-    user_prompt = f"""
-    [상황 정보]
-    - 대기질: 초미세먼지={pm25_raw}(보정후:{pm25_corrected}), 오존={o3_raw}(보정후:{o3_corrected})
-    - 환경: 온도={temp}°C, 습도={humidity}%
-    - 사용자: 연령대={age_group}, 기저질환={user_condition}
-    - 시스템 최종등급(4단계): {final_grade}
-    - 시스템 결정: {decision_text}
-    - 시스템 행동수칙: {action_items}
-    - 결정데이터 근거 문장: {csv_reason or "해당 없음"}
-    
-    [의학적 가이드라인 (참고 문헌)]
-    {context_text}
-    
-    위 결정이 내려진 배경과 이유를 학부모가 이해하기 쉽게 설명해주세요.
-    
-    출력 형식 (JSON):
-    {{
-      "three_reason": [
-        "첫 번째 요약 문장 (핵심 키워드는 **이렇게** 감싸기)",
-        "두 번째 요약 문장",
-        "세 번째 요약 문장"
-      ],
-      "detail_answer": "상세한 의학적 설명..."
-    }}
-    """
-    
+    system_prompt = (
+        "너는 학부모용 대기질 안내 코치다. "
+        "반드시 JSON 객체 하나만 반환한다. "
+        "키는 three_reason(정확히 3개 배열), detail_answer(설명)만 사용한다. "
+        "decision/actionItems와 모순되지 않게 작성하고, 과장 없이 실천 가능한 문장으로 답한다."
+    )
+
+    user_prompt = (
+        f"[입력]\n"
+        f"- 대기질: PM2.5={pm25_raw}(보정:{pm25_corrected}), O3={o3_raw}(보정:{o3_corrected})\n"
+        f"- 환경: 온도={temp}°C, 습도={humidity}%\n"
+        f"- 사용자: 연령대={age_group}, 기저질환={user_condition}\n"
+        f"- 최종등급: {final_grade}\n"
+        f"- 시스템 결정: {decision_text}\n"
+        f"- 시스템 행동수칙: {action_items}\n"
+        f"- 결정 근거 문장: {csv_reason or '해당 없음'}\n\n"
+        f"[의학 근거 요약]\n{context_text}\n\n"
+        f"[출력 규칙]\n"
+        f"- three_reason: 핵심 3줄, 각 문장 짧고 명확하게\n"
+        f"- detail_answer: 3~5문장, 최대 {ADVICE_DETAIL_MAX_CHARS}자\n"
+        f"- 한국어 JSON만 반환"
+    )
+
+    llm_started_at = perf_counter()
     try:
         response = openai_client.chat.completions.create(
             model="gpt-5-nano",
@@ -1616,23 +1667,44 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=1 
         )
-        
-        content = response.choices[0].message.content
+
+        timings["llm_ms"] = round((perf_counter() - llm_started_at) * 1000, 1)
+
+        content = response.choices[0].message.content or "{}"
         llm_result = json.loads(content)
+
+        raw_detail_answer = llm_result.get("detail_answer", "정보를 불러오는 중 문제가 발생했습니다.")
+        detail_answer = _truncate_text(raw_detail_answer, ADVICE_DETAIL_MAX_CHARS)
+        if not detail_answer:
+            detail_answer = "정보를 불러오는 중 문제가 발생했습니다."
+
+        raw_three_reason = llm_result.get("three_reason")
+        three_reason: List[str] = []
+        if isinstance(raw_three_reason, list):
+            for item in raw_three_reason:
+                sentence = _truncate_text(item, 90)
+                if sentence:
+                    three_reason.append(sentence)
+
+        fallback_three_reason = [
+            "대기질 정보를 분석하고 있습니다.",
+            "잠시 후 다시 확인해주세요.",
+            "문제가 지속되면 관리자에게 문의하세요."
+        ]
+        for fallback in fallback_three_reason:
+            if len(three_reason) >= 3:
+                break
+            three_reason.append(fallback)
+        three_reason = three_reason[:3]
         
         # Merge Results
         final_result = {
             "decision": decision_text,
             "csv_reason": csv_reason,
-            "reason": llm_result.get("detail_answer", "정보를 불러오는 중 문제가 발생했습니다."),
-            "three_reason": llm_result.get("three_reason", [
-                "대기질 정보를 분석하고 있습니다.",
-                "잠시 후 다시 확인해주세요.",
-                "문제가 지속되면 관리자에게 문의하세요."
-            ]),
-            "detail_answer": llm_result.get("detail_answer", "정보를 불러오는 중 문제가 발생했습니다."),
+            "reason": detail_answer,
+            "three_reason": three_reason,
+            "detail_answer": detail_answer,
             "actionItems": action_items,
             "references": list(set([doc.get("source", "Unknown Source") for doc in relevant_docs])),
             # Add real-time air quality values for frontend display
@@ -1641,6 +1713,12 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
             "pm10_value": air_data.get("pm10_value"),
             "no2_value": air_data.get("no2_value")
         }
+
+        print(
+            "🧾 Advice prompt stats "
+            f"station={station_name} context_docs={context_doc_count} "
+            f"context_chars={context_chars} detail_max_chars={ADVICE_DETAIL_MAX_CHARS}"
+        )
         
         # [Step F] Save to Cache
         if db is not None and cache_key:
@@ -1653,10 +1731,15 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
                 print(f"💾 Saved to cache: {cache_key}")
             except Exception as e:
                 print(f"Error saving to cache: {e}")
-                
+
+        timings["total_ms"] = round((perf_counter() - request_started_at) * 1000, 1)
+        _log_advice_timing(station_name, cache_hit=cache_hit, timings=timings, stage="ok")
         return final_result
         
     except Exception as e:
+        timings["llm_ms"] = round((perf_counter() - llm_started_at) * 1000, 1)
+        timings["total_ms"] = round((perf_counter() - request_started_at) * 1000, 1)
+        _log_advice_timing(station_name, cache_hit=cache_hit, timings=timings, stage="llm_error")
         print(f"Error calling OpenAI: {e}")
         # Fallback even if LLM fails, we satisfy the deterministic requirement
         return {
