@@ -2,7 +2,7 @@
 
 ## 프로젝트 개요
 
-EPI-LOG AI는 대기질(미세먼지/오존 등)과 사용자 프로필을 기반으로 맞춤형 건강 행동 가이드를 제공하는 RAG 기반 API 서버입니다. 의료 가이드라인을 벡터 검색으로 불러오고, LLM을 통해 근거(reason)를 생성합니다.
+EPI-LOG AI는 대기질(미세먼지/오존 등)과 사용자 프로필을 기반으로 맞춤형 건강 행동 가이드를 제공하는 API 서버입니다. 핵심 결정/행동지침은 규칙 기반으로 생성하고, 벡터 검색 + LLM은 설정/의존성 상태에 따라 선택적으로 근거 문장을 보강합니다.
 
 ## 시스템 아키텍처
 
@@ -44,14 +44,22 @@ sequenceDiagram
     DB-->>API: cached data
     API-->>Client: decision/reason/actionItems
   else 캐시 미스
-    API->>VO: 쿼리 임베딩
-    VO-->>API: query vector
-    API->>DB: 벡터 검색 (guidelines)
-    DB-->>API: 관련 문서
-    API->>LLM: reason 생성 요청 (guidelines 포함)
-    LLM-->>API: reason JSON
-    API->>DB: 캐시 저장
-    API-->>Client: decision/reason/actionItems
+    alt 벡터 검색 활성(설정 + 의존성 OK)
+      API->>VO: 쿼리 임베딩
+      VO-->>API: query vector
+      API->>DB: 벡터 검색 (guidelines)
+      DB-->>API: 관련 문서
+    else 벡터 검색 비활성/실패
+      API->>API: 가이드라인 컨텍스트 없이 진행
+    end
+    API->>LLM: reason 생성 요청
+    alt LLM 성공
+      LLM-->>API: reason JSON
+      API->>DB: 캐시 저장
+      API-->>Client: decision/reason/actionItems
+    else LLM 실패
+      API-->>Client: decision/actionItems + fallback detail (현재 캐시 미저장)
+    end
   end
 ```
 
@@ -77,11 +85,12 @@ sequenceDiagram
 - **핵심 모듈**: `main.py` (라우팅) → `app/services.py` (비즈니스 로직)
 - **데이터 저장소**:
   - `medical_guidelines`: 임베딩 포함 가이드라인/문서
-  - `daily_air_quality`: 날짜별 대기질 데이터
+  - `air_quality_data`: 실시간/주기 적재 대기질 데이터(우선 조회)
+  - `daily_air_quality`: 레거시/보조 컬렉션
   - `rag_cache`: 사용자/대기질 기반 캐시
 - **결정 로직**: PM2.5/PM10/O3 및 보정 로직을 반영한 4단계(`좋음/보통/나쁨/매우나쁨`) 등급으로 CSV 80행 매트릭스 매핑
-- **응답 구성**: 결정 텍스트 + 행동 지침(템플릿) + LLM reason
-- **폴백 로직**: 캐시 실패, 벡터 검색 실패, LLM 실패에 대한 안전 장치 포함
+- **응답 구성**: 결정 텍스트 + 행동 지침(규칙 기반) + 상세 설명(LLM 성공 시 생성, 실패 시 폴백 문구)
+- **폴백 로직**: 대기질(MongoDB → AirKorea → Mock), 벡터 검색 비활성/실패, LLM 실패 시 폴백 응답
 
 ## 상세 기능 요구사항 (Functional Requirements)
 
@@ -91,10 +100,11 @@ sequenceDiagram
 - 시스템은 당일 대기질을 조회한다.
 - 대기질 데이터가 없을 경우 개발용 모의 데이터로 대체한다.
 - 대기질과 사용자 프로필을 기반으로 캐시 키를 생성하고 결과 캐시를 조회한다.
-- 캐시가 없으면, 검색 쿼리를 구성하고 벡터 검색을 수행한다.
-- 검색 결과(가이드라인)를 바탕으로 LLM에 reason 생성을 요청한다.
+- 캐시가 없으면, 검색 쿼리를 구성하고 (설정 시) 벡터 검색을 수행한다.
+- 벡터 검색은 `ADVICE_VECTOR_SEARCH_ENABLED=1` 이고 Voyage/DB 사용 가능할 때만 동작한다.
+- LLM에 상세 설명 생성을 요청하고, 실패 시 규칙 기반 결정/행동지침으로 폴백 응답을 반환한다.
 - 결정 텍스트 및 행동 지침은 시스템 규칙 기반으로 산출한다.
-- 최종 결과는 캐시에 저장한다.
+- 최종 결과 캐시는 현재 구현상 LLM 성공 경로에서 저장된다.
 
 ### B. 문서/PDF 인입
 
@@ -108,6 +118,7 @@ sequenceDiagram
 - `scripts/ingest_data.py`: `data/guidelines.json`을 임베딩 후 DB에 적재한다.
 - `scripts/ingest_pdfs.py`: `upload/` 폴더의 PDF들을 배치로 임베딩 후 적재한다.
 - Voyage AI의 Rate Limit을 고려한 재시도/지연 로직을 포함한다.
+- `data/guidelines.json`은 레포 기본 포함 파일이 아니므로 별도 준비가 필요하다.
 
 ### D. 운영/배포
 
@@ -170,7 +181,7 @@ CSV 컬럼 반환 규칙:
   - `dataTime`: String | null
 - **Status**
   - `200`: 정상 반환
-  - `404`: 해당 측정소 데이터 없음
+  - `404`: 해당 측정소 데이터 없음 (현재 구현에서는 최종 Mock fallback이 있어 일반적으로 `200` 반환)
   - `500`: 내부 오류
 - **동작 우선순위**
   1. MongoDB `air_quality_data`
@@ -183,13 +194,19 @@ curl -G "https://<your-domain>/api/air-quality" \
   --data-urlencode "stationName=종로구"
 ```
 
-### 4) Clothing Recommendation (Rule-based)
+### 4) Clothing Recommendation (Rule + AI Hybrid)
 
 - **POST** `/api/clothing-recommendation`
 - **Content-Type**: `application/json`
 - **Request Body**
   - `temperature` (Number, optional, default `22.0`)
   - `humidity` (Number, optional, default `45.0`)
+  - `userProfile` (Object, optional)
+    - `ageGroup`: `"infant" | "toddler" | "elementary_low" | "elementary_high" | "teen_adult"`
+    - `condition`: `"general" | "rhinitis" | "asthma" | "atopy"`
+  - `airQuality` (Object, optional)
+    - `grade`, `pm25Grade`, `pm10Grade`, `o3Grade`
+  - `airGrade` (String, optional): `airQuality.grade` 별칭 입력
 - **Response**
   - `summary`: String
   - `recommendation`: String
@@ -197,10 +214,16 @@ curl -G "https://<your-domain>/api/air-quality" \
   - `comfortLevel`: `"FREEZING" | "COLD" | "CHILLY" | "MILD" | "WARM" | "HOT"`
   - `temperature`: Number
   - `humidity`: Number
-  - `source`: String (`rule-based-v1` 또는 오류 시 `fallback`)
+  - `source`: String
+    - `rule-based-v1`
+    - `ai-dynamic-v1`
+    - `rule-based-fallback-no-openai`
+    - `rule-based-fallback-on-error`
+    - `fallback` (엔드포인트 레벨 예외 시)
 - **동작 규칙**
-  - 현재 구현은 규칙 기반 추천을 반환
-  - 서버 오류 시 fallback 응답 반환
+  - 기본은 규칙 기반(`rule-based-v1`) 추천을 반환
+  - `userProfile` + `airQuality(또는 airGrade)`가 함께 들어오고 OpenAI 호출 성공 시 AI 개인화(`ai-dynamic-v1`)로 전환
+  - OpenAI 미구성/호출 실패 시 규칙 기반 폴백 source로 반환
 
 예시:
 ```bash
@@ -224,7 +247,8 @@ curl -X POST "https://<your-domain>/api/clothing-recommendation" \
   - `inserted_ids`: String[] (성공 시)
 - **Error**
   - `400`: PDF가 아닌 파일 업로드
-  - `500`: 처리 실패
+  - `500`: 라우트 레벨 예외
+  - `200` + `status=error`: 인입 처리 로직 실패(예: Voyage/DB 초기화 실패, 텍스트 추출 실패)
 
 ### 6) OpenAI Responses Proxy (Server-to-Server)
 
@@ -259,6 +283,8 @@ curl -X POST "https://<your-domain>/api/openai/v1/responses" \
 ## 환경 변수
 
 - `MONGODB_URI` (or `MONGO_URI`)
+- `MONGO_DB_NAME` (기본: `epilog_db`)
+- `AIR_QUALITY_DB_NAME` (미설정 시 URI에서 추론 또는 `MONGO_DB_NAME` 사용)
 - `VOYAGE_API_KEY`
 - `OPENAI_API_KEY`
 - `ADVICE_VECTOR_SEARCH_ENABLED` (기본: `0`, `1`로 설정 시 Voyage 벡터 검색 활성화)
@@ -280,4 +306,4 @@ curl -X POST "https://<your-domain>/api/openai/v1/responses" \
 pip install -r requirements.txt
 uvicorn main:app --reload
 ```
-# Updated: Thu Feb  5 22:11:20 KST 2026
+# Updated: Fri Mar  6 14:40:00 KST 2026
