@@ -89,8 +89,8 @@ sequenceDiagram
   - `daily_air_quality`: 레거시/보조 컬렉션
   - `rag_cache`: 사용자/대기질 기반 캐시
 - **결정 로직**: PM2.5/PM10/O3 및 보정 로직을 반영한 4단계(`좋음/보통/나쁨/매우나쁨`) 등급으로 CSV 80행 매트릭스 매핑
-- **응답 구성**: 결정 텍스트 + 행동 지침(규칙 기반) + 상세 설명(LLM 성공 시 생성, 실패 시 폴백 문구)
-- **폴백 로직**: 대기질(MongoDB → AirKorea → Mock), 벡터 검색 비활성/실패, LLM 실패 시 폴백 응답
+- **응답 구성**: 결정 텍스트 + 행동 지침(규칙 기반) + 상세 설명(LLM 성공 시 생성, 실패 시 결정형 대체 설명 생성)
+- **폴백 로직**: 대기질(MongoDB → AirKorea → Mock), 벡터 검색 비활성/실패, LLM 실패 시에도 계약 필드(`reason/detail_answer/three_reason`)를 의미 있는 문장으로 유지
 
 ## 상세 기능 요구사항 (Functional Requirements)
 
@@ -102,7 +102,7 @@ sequenceDiagram
 - 대기질과 사용자 프로필을 기반으로 캐시 키를 생성하고 결과 캐시를 조회한다.
 - 캐시가 없으면, 검색 쿼리를 구성하고 (설정 시) 벡터 검색을 수행한다.
 - 벡터 검색은 `ADVICE_VECTOR_SEARCH_ENABLED=1` 이고 Voyage/DB 사용 가능할 때만 동작한다.
-- LLM에 상세 설명 생성을 요청하고, 실패 시 규칙 기반 결정/행동지침으로 폴백 응답을 반환한다.
+- LLM에 상세 설명 생성을 요청하고, 실패 시에도 규칙 기반 결정/행동지침과 실측값으로 결정형 설명을 합성해 반환한다.
 - 결정 텍스트 및 행동 지침은 시스템 규칙 기반으로 산출한다.
 - 최종 결과 캐시는 현재 구현상 LLM 성공 경로에서 저장된다.
 
@@ -287,14 +287,17 @@ curl -X POST "https://<your-domain>/api/openai/v1/responses" \
 - `AIR_QUALITY_DB_NAME` (미설정 시 URI에서 추론 또는 `MONGO_DB_NAME` 사용)
 - `VOYAGE_API_KEY`
 - `OPENAI_API_KEY`
+- `OPENAI_MAX_RETRIES` (기본: `0`)
+- `ADVICE_LLM_MODEL` (기본: `gpt-4.1-nano`)
+- `CLOTHING_LLM_MODEL` (기본: `gpt-4.1-nano`, 미설정 시 `ADVICE_LLM_MODEL` 사용)
 - `ADVICE_VECTOR_SEARCH_ENABLED` (기본: `0`, `1`로 설정 시 Voyage 벡터 검색 활성화)
-- `ADVICE_LLM_TIMEOUT_MS` (기본: `2200`)
+- `ADVICE_LLM_TIMEOUT_MS` (기본: `4500`)
 - `ADVICE_*_TIMEOUT_MS` 계열은 코드에서 상/하한 클램프가 적용됩니다.
   - `ADVICE_AIR_FETCH_TIMEOUT_MS`: 300~5000
   - `ADVICE_CACHE_READ_TIMEOUT_MS`: 150~1800
   - `ADVICE_VECTOR_EMBED_TIMEOUT_MS`: 250~2500
   - `ADVICE_VECTOR_QUERY_TIMEOUT_MS`: 200~2200
-  - `ADVICE_LLM_TIMEOUT_MS`: 600~4500
+  - `ADVICE_LLM_TIMEOUT_MS`: 600~12000
   - `ADVICE_CACHE_WRITE_TIMEOUT_MS`: 150~1800
 - `OPENAI_PROXY_TOKEN` (권장, 프록시 보호용)
 - `OPENAI_UPSTREAM_BASE_URL` (기본: `https://api.openai.com/v1`)
