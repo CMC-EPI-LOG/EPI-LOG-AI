@@ -85,6 +85,9 @@ curl -X POST "https://<your-domain>/api/advice" \
 - `references` (Array[String]): 벡터 검색으로 참조된 출처
 - `pm25_value`, `pm10_value`, `o3_value`, `no2_value` (Number): 현재 대기질 수치(실행 시점에 포함될 수 있음)
 
+Note:
+- OpenAI 생성이 실패해도 `/api/advice`는 `decision/actionItems/csv_reason/실측값`을 바탕으로 `reason`, `detail_answer`, `three_reason`를 결정형 문장으로 합성해 반환합니다.
+
 ### CSV Mapping Rule
 `/api/advice`는 CSV 컬럼명을 그대로 반환하지 않고 아래처럼 매핑해서 반환합니다.
 

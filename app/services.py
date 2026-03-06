@@ -619,7 +619,7 @@ def get_ai_clothing_recommendation(
 
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-5-nano",
+            model=CLOTHING_LLM_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -1060,8 +1060,17 @@ except Exception as e:
     print(f"Error initializing Voyage AI client: {e}")
     vo_client = None
 
+OPENAI_MAX_RETRIES = _bounded_int_env(
+    "OPENAI_MAX_RETRIES",
+    0,
+    min_value=0,
+    max_value=3,
+)
+ADVICE_LLM_MODEL = (os.getenv("ADVICE_LLM_MODEL") or "gpt-4.1-nano").strip() or "gpt-4.1-nano"
+CLOTHING_LLM_MODEL = (os.getenv("CLOTHING_LLM_MODEL") or ADVICE_LLM_MODEL).strip() or ADVICE_LLM_MODEL
+
 try:
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    openai_client = OpenAI(api_key=OPENAI_API_KEY, max_retries=OPENAI_MAX_RETRIES)
 except Exception as e:
     print(f"Error initializing OpenAI client: {e}")
     openai_client = None
@@ -1425,9 +1434,9 @@ ADVICE_VECTOR_QUERY_TIMEOUT_MS = _bounded_int_env(
 )
 ADVICE_LLM_TIMEOUT_MS = _bounded_int_env(
     "ADVICE_LLM_TIMEOUT_MS",
-    2200,
+    4500,
     min_value=600,
-    max_value=4500,
+    max_value=12000,
 )
 ADVICE_CACHE_WRITE_TIMEOUT_MS = _bounded_int_env(
     "ADVICE_CACHE_WRITE_TIMEOUT_MS",
@@ -1544,6 +1553,62 @@ def _enforce_advice_response_limits(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     normalized["three_reason"] = three_reason[:3]
     return normalized
+
+
+def _build_metric_summary(air_data: Dict[str, Any]) -> str:
+    metric_parts: List[str] = []
+    if air_data.get("pm25_value") is not None:
+        metric_parts.append(f"초미세먼지 {air_data['pm25_value']}ug/m3")
+    if air_data.get("pm10_value") is not None:
+        metric_parts.append(f"미세먼지 {air_data['pm10_value']}ug/m3")
+    if air_data.get("o3_value") is not None:
+        metric_parts.append(f"오존 {air_data['o3_value']}ppm")
+    if air_data.get("no2_value") is not None:
+        metric_parts.append(f"이산화질소 {air_data['no2_value']}ppm")
+    return ", ".join(metric_parts)
+
+
+def _build_deterministic_advice_payload(
+    *,
+    decision_text: str,
+    csv_reason: str,
+    action_items: List[str],
+    air_data: Dict[str, Any],
+    references: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    reason_items: List[str] = []
+
+    csv_reason_text = _normalize_whitespace(csv_reason)
+    if csv_reason_text:
+        reason_items.append(csv_reason_text)
+    else:
+        reason_items.append("현재 대기질 수치와 사용자 조건을 함께 반영해 안내했어요.")
+
+    metric_summary = _build_metric_summary(air_data)
+    if metric_summary:
+        reason_items.append(f"{metric_summary} 기준으로 판단했어요.")
+
+    visible_actions = [item for item in action_items if _normalize_whitespace(item)]
+    if visible_actions:
+        reason_items.append(f"우선 {', '.join(visible_actions[:2])}부터 챙겨주세요.")
+
+    detail_answer = " ".join(reason_items[:3])
+    if not detail_answer:
+        detail_answer = "현재 대기질 수치와 사용자 조건을 함께 반영해 안내했어요."
+
+    return _enforce_advice_response_limits({
+        "decision": decision_text,
+        "csv_reason": csv_reason,
+        "reason": detail_answer,
+        "three_reason": reason_items[:3],
+        "detail_answer": detail_answer,
+        "actionItems": action_items,
+        "references": references or [],
+        "pm25_value": air_data.get("pm25_value"),
+        "o3_value": air_data.get("o3_value"),
+        "pm10_value": air_data.get("pm10_value"),
+        "no2_value": air_data.get("no2_value"),
+    })
 
 
 def _normalize_cache_token(value: Any) -> str:
@@ -1785,21 +1850,6 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     context_doc_count = min(len(relevant_docs), ADVICE_CONTEXT_DOC_LIMIT)
     context_chars = len(context_text)
 
-    if not openai_client:
-         timings["total_ms"] = round((perf_counter() - request_started_at) * 1000, 1)
-         _log_advice_timing(station_name, cache_hit=cache_hit, timings=timings, stage="no_openai_client")
-         return {
-            "decision": "Error",
-            "three_reason": [
-                "**AI 시스템**이 초기화되지 않았습니다.",
-                "서버 설정을 확인해주세요.",
-                "**관리자**에게 문의하세요."
-            ],
-            "detail_answer": "OpenAI Client not initialized",
-            "actionItems": [],
-            "references": []
-        }
-
     # Calculate 4-level final grade and map directly into the 80-row matrix.
     final_grade = _calculate_final_grade(pm25_corrected, air_data.get("pm10_grade"), o3_corrected)
     final_grade_score = GRADE_MAP.get(final_grade, 2)
@@ -1835,6 +1885,17 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
     if GRADE_MAP.get(pm25_corrected, 1) >= 3 and GRADE_MAP.get(o3_corrected, 1) >= 3:
         decision_text += " (미세먼지와 오존 둘 다 높아요!)"
 
+    if not openai_client:
+         timings["total_ms"] = round((perf_counter() - request_started_at) * 1000, 1)
+         _log_advice_timing(station_name, cache_hit=cache_hit, timings=timings, stage="no_openai_client")
+         print("⚠️ OpenAI client unavailable, returning deterministic advice fallback")
+         return _build_deterministic_advice_payload(
+            decision_text=decision_text,
+            csv_reason=csv_reason or "",
+            action_items=action_items,
+            air_data=air_data,
+        )
+
     system_prompt = (
         "너는 학부모용 대기질 안내 코치다. "
         "반드시 JSON 객체 하나만 반환한다. "
@@ -1863,7 +1924,7 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
         response = await _run_blocking_with_timeout(
             ADVICE_LLM_TIMEOUT_MS,
             openai_client.chat.completions.create,
-            model="gpt-5-nano",
+            model=ADVICE_LLM_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -1958,25 +2019,12 @@ async def get_medical_advice(station_name: str, user_profile: Dict[str, Any]) ->
             print(f"⚠️ LLM call timed out: station={station_name} timeout_ms={ADVICE_LLM_TIMEOUT_MS}")
         else:
             print(f"Error calling OpenAI: {e}")
-        # Fallback even if LLM fails, we satisfy the deterministic requirement
-        return _enforce_advice_response_limits({
-            "decision": decision_text,
-            "csv_reason": csv_reason,
-            "reason": "일시적인 오류로 상세 설명을 불러오지 못했습니다. 하지만 행동 지침은 위와 같이 준수해주세요.",
-            "three_reason": [
-                "일시적인 오류로 상세 분석을 불러오지 못했습니다.",
-                "하지만 **행동 지침**은 위와 같이 준수해주세요.",
-                "문제가 지속되면 **관리자**에게 문의하세요."
-            ],
-            "detail_answer": "일시적인 오류로 상세 설명을 불러오지 못했습니다. 하지만 행동 지침은 위와 같이 준수해주세요.",
-            "actionItems": action_items,
-            "references": [],
-            # Add real-time air quality values for frontend display
-            "pm25_value": air_data.get("pm25_value"),
-            "o3_value": air_data.get("o3_value"),
-            "pm10_value": air_data.get("pm10_value"),
-            "no2_value": air_data.get("no2_value")
-        })
+        return _build_deterministic_advice_payload(
+            decision_text=decision_text,
+            csv_reason=csv_reason or "",
+            action_items=action_items,
+            air_data=air_data,
+        )
 
 async def ingest_pdf(file_content: bytes, filename: str) -> Dict[str, Any]:
     """
