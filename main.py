@@ -1,18 +1,29 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 import uvicorn
 import os
 from contextlib import asynccontextmanager
 
-from app.services import get_medical_advice, ingest_pdf, db, get_ai_clothing_recommendation
+from app.services import (
+    get_medical_advice,
+    ingest_pdf,
+    db,
+    get_ai_clothing_recommendation,
+    get_ops_metrics_summary,
+    render_ops_dashboard_html,
+)
+from app.monitoring import capture_exception, initialize_sentry
 from app.openai_proxy import router as openai_proxy_router
 
 # Define Request Model
 class AdviceRequest(BaseModel):
     stationName: str
     userProfile: Dict[str, Any]
+    currentAirQuality: Optional[Dict[str, Any]] = None
+    authoritativeAirQuality: Optional[Dict[str, Any]] = None
+    airQualitySummary: Optional[str] = None
 
 # Define Response Model
 class AdviceResponse(BaseModel):
@@ -23,6 +34,10 @@ class AdviceResponse(BaseModel):
     detail_answer: str       # Detailed medical explanation
     actionItems: List[str]
     references: List[str]
+    pm25_value: Optional[float] = None
+    pm10_value: Optional[float] = None
+    o3_value: Optional[float] = None
+    no2_value: Optional[float] = None
 
 
 class ClothingRecommendationRequest(BaseModel):
@@ -42,6 +57,9 @@ class ClothingRecommendationResponse(BaseModel):
     humidity: float
     source: str
 
+initialize_sentry()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup logic
@@ -55,19 +73,78 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Epilogue API", lifespan=lifespan)
 app.include_router(openai_proxy_router)
+ADMIN_DASHBOARD_TOKEN = os.getenv("ADMIN_DASHBOARD_TOKEN")
+
+
+def _admin_authorized(request: Request) -> bool:
+    if not ADMIN_DASHBOARD_TOKEN:
+        return True
+    provided = request.headers.get("x-admin-token") or request.query_params.get("token")
+    return bool(provided and provided == ADMIN_DASHBOARD_TOKEN)
 
 @app.get("/")
 def read_root():
     return {"status": "ok", "service": "Epilogue API"}
 
+
+@app.get("/api/admin/ops-metrics")
+async def get_ops_metrics_endpoint(request: Request, hours: int = 24, recent: int = 50):
+    if not _admin_authorized(request):
+        return JSONResponse(status_code=403, content={"error": "Forbidden"})
+
+    try:
+        summary = await get_ops_metrics_summary(hours=hours, recent_limit=recent)
+        return JSONResponse(content=summary)
+    except Exception as e:
+        print(f"Error fetching ops metrics: {e}")
+        capture_exception(
+            e,
+            route="/api/admin/ops-metrics",
+            extra={"hours": hours, "recent": recent},
+        )
+        return JSONResponse(status_code=500, content={"error": "Internal Server Error", "details": str(e)})
+
+
+@app.get("/admin/ops-dashboard")
+async def ops_dashboard(request: Request, hours: int = 24, recent: int = 50):
+    if not _admin_authorized(request):
+        return JSONResponse(status_code=403, content={"error": "Forbidden"})
+
+    try:
+        summary = await get_ops_metrics_summary(hours=hours, recent_limit=recent)
+        return HTMLResponse(content=render_ops_dashboard_html(summary))
+    except Exception as e:
+        print(f"Error rendering ops dashboard: {e}")
+        capture_exception(
+            e,
+            route="/admin/ops-dashboard",
+            extra={"hours": hours, "recent": recent},
+        )
+        return JSONResponse(status_code=500, content={"error": "Internal Server Error", "details": str(e)})
+
 @app.post("/api/advice", response_model=AdviceResponse)
 async def give_advice(request: AdviceRequest):
     try:
         # Delegate logic to service layer
-        result = await get_medical_advice(request.stationName, request.userProfile)
+        result = await get_medical_advice(
+            request.stationName,
+            request.userProfile,
+            current_air_quality=request.authoritativeAirQuality or request.currentAirQuality,
+            air_quality_summary=request.airQualitySummary,
+        )
         return JSONResponse(content=result)
     except Exception as e:
         print(f"Error processing advice request: {e}")
+        capture_exception(
+            e,
+            route="/api/advice",
+            tags={"station.requested": request.stationName},
+            extra={
+                "profile": request.userProfile,
+                "currentAirQuality": request.currentAirQuality,
+                "authoritativeAirQuality": request.authoritativeAirQuality,
+            },
+        )
         return JSONResponse(
             status_code=500,
             content={
@@ -105,6 +182,11 @@ async def get_air_quality_endpoint(stationName: str):
         return JSONResponse(content=data)
     except Exception as e:
         print(f"Error fetching air quality: {e}")
+        capture_exception(
+            e,
+            route="/api/air-quality",
+            tags={"station.requested": stationName},
+        )
         return JSONResponse(
             status_code=500,
             content={"error": "Internal Server Error", "details": str(e)}
@@ -127,6 +209,16 @@ async def clothing_recommendation(request: ClothingRecommendationRequest):
         return JSONResponse(content=result)
     except Exception as e:
         print(f"Error generating clothing recommendation: {e}")
+        capture_exception(
+            e,
+            route="/api/clothing-recommendation",
+            extra={
+                "temperature": request.temperature,
+                "humidity": request.humidity,
+                "userProfile": request.userProfile,
+                "airQuality": air_quality,
+            },
+        )
         return JSONResponse(
             status_code=500,
             content={
@@ -152,6 +244,11 @@ async def upload_pdf(file: UploadFile = File(...)):
         result = await ingest_pdf(content, file.filename)
         return JSONResponse(content=result)
     except Exception as e:
+         capture_exception(
+             e,
+             route="/api/ingest/pdf",
+             tags={"file.name": file.filename or "unknown"},
+         )
          return JSONResponse(status_code=500, content={"message": str(e)})
 
 if __name__ == "__main__":
