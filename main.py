@@ -14,7 +14,7 @@ from app.services import (
     get_ops_metrics_summary,
     render_ops_dashboard_html,
 )
-from app.monitoring import capture_exception, flush, initialize_sentry
+from app.monitoring import capture_exception, initialize_sentry
 from app.openai_proxy import router as openai_proxy_router
 
 # Define Request Model
@@ -122,24 +122,6 @@ async def ops_dashboard(request: Request, hours: int = 24, recent: int = 50):
         )
         return JSONResponse(status_code=500, content={"error": "Internal Server Error", "details": str(e)})
 
-
-@app.post("/api/admin/sentry-test")
-async def sentry_test(request: Request):
-    if not _admin_authorized(request):
-        return JSONResponse(status_code=403, content={"error": "Forbidden"})
-
-    event_id = capture_exception(
-        RuntimeError("Manual Sentry test from epi-log-ai"),
-        route="/api/admin/sentry-test",
-        tags={"sentry.test": "true"},
-        extra={
-            "method": request.method,
-            "path": request.url.path,
-            "host": request.headers.get("host"),
-        },
-    )
-    flush()
-    return JSONResponse(status_code=202, content={"ok": True, "eventId": event_id})
 
 @app.post("/api/advice", response_model=AdviceResponse)
 async def give_advice(request: AdviceRequest):

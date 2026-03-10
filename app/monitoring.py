@@ -66,9 +66,3 @@ def capture_exception(
             scope.set_extra(key, value)
 
         return sentry_sdk.capture_exception(error)
-
-
-def flush(timeout: float = 2.0) -> None:
-    if not _SENTRY_INITIALIZED:
-        return
-    sentry_sdk.flush(timeout=timeout)
