@@ -19,6 +19,9 @@ Retrieves context-aware medical advice based on air quality and user profile.
 |-------|------|-------------|---------|
 | `stationName` | String | Station name for Air Quality lookup | `"강남구"` |
 | `userProfile` | Object | User's health profile | See below |
+| `currentAirQuality` | Object | 상위 BFF가 전달하는 authoritative 현재 대기질/온습도 컨텍스트 | See below |
+| `authoritativeAirQuality` | Object | `currentAirQuality`와 동일 의미의 별칭. 둘 다 오면 이 값을 우선 사용 | See below |
+| `airQualitySummary` | String | 현재 수치를 한 줄로 요약한 설명. 프롬프트 기준 문장으로 사용 | `"강남구 기준, 측정시각 2026-03-08 21:00, 초미세먼지 19ug/m3 ..."` |
 
 **`userProfile` Schema (canonical values):**
 ```json
@@ -29,6 +32,25 @@ Retrieves context-aware medical advice based on air quality and user profile.
 ```
 
 Aliases like `teen`, `none`, `healthy`, `normal`, `일반` are accepted and normalized internally.
+
+**`currentAirQuality` / `authoritativeAirQuality` Schema (optional):**
+```json
+{
+  "requestedStation": "강남구",
+  "resolvedStation": "강남구",
+  "stationName": "강남구",
+  "sidoName": "서울",
+  "dataTime": "2026-03-08 21:00",
+  "pm25_value": 19,
+  "pm10_value": 29,
+  "o3_value": 0.039,
+  "no2_value": 0.017,
+  "co_value": 0.4,
+  "so2_value": 0.003,
+  "temp": 2,
+  "humidity": 70
+}
+```
 
 **`ageGroup` Label Guide (KR, canonical):**
 - `infant`: 영아(0-2세)
@@ -43,7 +65,19 @@ curl -X POST "https://<your-domain>/api/advice" \
      -H "Content-Type: application/json" \
      -d '{
            "stationName": "서초구",
-           "userProfile": { "ageGroup": "elementary_high", "condition": "asthma" }
+           "userProfile": { "ageGroup": "elementary_high", "condition": "asthma" },
+           "currentAirQuality": {
+             "resolvedStation": "서초구",
+             "sidoName": "서울",
+             "dataTime": "2026-03-08 21:00",
+             "pm25_value": 19,
+             "pm10_value": 29,
+             "o3_value": 0.039,
+             "no2_value": 0.017,
+             "temp": 2,
+             "humidity": 70
+           },
+           "airQualitySummary": "서초구 기준, 측정시각 2026-03-08 21:00, 초미세먼지 19ug/m3, 미세먼지 29ug/m3, 오존 0.039ppm, 이산화질소 0.017ppm, 기온 2도, 습도 70%"
          }'
 ```
 
@@ -87,6 +121,10 @@ curl -X POST "https://<your-domain>/api/advice" \
 
 Note:
 - OpenAI 생성이 실패해도 `/api/advice`는 `decision/actionItems/csv_reason/실측값`을 바탕으로 `reason`, `detail_answer`, `three_reason`를 결정형 문장으로 합성해 반환합니다.
+- `currentAirQuality` 또는 `authoritativeAirQuality`가 오면 AI 서버는 자체 대기질 조회보다 이 값을 우선 사용합니다.
+- OpenAI 프롬프트도 전달된 현재 수치와 측정시각을 사실 기준으로 사용하며, 캐시 키 역시 해당 수치와 온습도를 포함해 분리됩니다.
+- 부분 payload만 와도 누락 필드는 서버 내부 조회값으로 보완한 뒤 overlay된 결과를 기준으로 판단합니다.
+- 서버 내부 조회는 `weather_forecast.weather_forecast_data_shadow`에서 KMA 최신 예보를 우선 읽어 온습도를 결합하고, KMA 미스일 때만 기존 문서값/기본값으로 내려갑니다.
 
 ### CSV Mapping Rule
 `/api/advice`는 CSV 컬럼명을 그대로 반환하지 않고 아래처럼 매핑해서 반환합니다.
@@ -162,7 +200,8 @@ curl -G "https://<your-domain>/api/air-quality" \
 동작 우선순위:
 1. MongoDB `air_quality_data` 최신 데이터
 2. Air Korea fallback API
-3. Mock data fallback
+3. KMA weather forecast DB에서 최신 온습도 보강
+4. Mock data fallback
 
 ---
 
@@ -220,6 +259,47 @@ Uploads a single PDF file to the vector database.
 | Field | Type | Description |
 |-------|------|-------------|
 | `file` | File | PDF file to upload |
+
+---
+
+## 5. Ops Metrics
+운영용 지표를 JSON으로 반환합니다.
+
+- **Endpoint:** `GET /api/admin/ops-metrics`
+- **Query Parameters:** `hours`(기본 `24`), `recent`(기본 `50`)
+- **Auth:** `ADMIN_DASHBOARD_TOKEN`이 설정된 경우 `x-admin-token` 헤더 또는 `?token=` 쿼리 필요
+
+### Example Request
+```bash
+curl -G "https://<your-domain>/api/admin/ops-metrics" \
+  -H "x-admin-token: <ADMIN_DASHBOARD_TOKEN>" \
+  --data-urlencode "hours=24" \
+  --data-urlencode "recent=20"
+```
+
+### Example Response Fields
+- `fallbackRatio`
+- `overlayUsageRatio`
+- `llmTimeoutRatio`
+- `staleCacheUsageRatio`
+- `cacheHitRatio`
+- `forecastIngestStatus`
+- `forecastIngestStaleRatio`
+- `stationResolutionFailureRatio`
+- `airFetchModeBreakdown`
+- `airSourceBreakdown`
+- `weatherSourceBreakdown`
+- `stageBreakdown`
+- `recentEvents`
+
+---
+
+## 6. Ops Dashboard
+브라우저에서 운영 지표를 바로 보는 관리자 대시보드입니다.
+
+- **Endpoint:** `GET /admin/ops-dashboard`
+- **Query Parameters:** `hours`, `recent`
+- **Auth:** `ADMIN_DASHBOARD_TOKEN`이 설정된 경우 `x-admin-token` 헤더 또는 `?token=` 쿼리 필요
 
 ### Example Request
 ```bash
