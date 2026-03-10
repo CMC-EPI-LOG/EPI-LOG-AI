@@ -52,9 +52,9 @@ def capture_exception(
     route: str,
     tags: Optional[Mapping[str, str]] = None,
     extra: Optional[Mapping[str, Any]] = None,
-) -> None:
+) -> Optional[str]:
     if not _SENTRY_INITIALIZED:
-        return
+        return None
 
     with sentry_sdk.push_scope() as scope:
         scope.set_tag("api.route", route)
@@ -65,4 +65,10 @@ def capture_exception(
         for key, value in (extra or {}).items():
             scope.set_extra(key, value)
 
-        sentry_sdk.capture_exception(error)
+        return sentry_sdk.capture_exception(error)
+
+
+def flush(timeout: float = 2.0) -> None:
+    if not _SENTRY_INITIALIZED:
+        return
+    sentry_sdk.flush(timeout=timeout)
