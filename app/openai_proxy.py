@@ -5,6 +5,8 @@ import httpx
 from fastapi import APIRouter, Body, Header, HTTPException
 from fastapi.responses import JSONResponse, Response
 
+from app.monitoring import capture_exception
+
 router = APIRouter()
 
 
@@ -57,9 +59,21 @@ async def proxy_openai_responses(
     try:
         async with httpx.AsyncClient(timeout=cfg["timeout_seconds"]) as client:
             upstream = await client.post(upstream_url, json=payload, headers=headers)
-    except httpx.TimeoutException:
+    except httpx.TimeoutException as exc:
+        capture_exception(
+            exc,
+            route="/api/openai/v1/responses",
+            tags={"upstream.service": "openai"},
+            extra={"upstream_url": upstream_url, "failure": "timeout"},
+        )
         raise HTTPException(status_code=504, detail="OpenAI upstream timeout")
     except httpx.HTTPError as exc:
+        capture_exception(
+            exc,
+            route="/api/openai/v1/responses",
+            tags={"upstream.service": "openai"},
+            extra={"upstream_url": upstream_url, "failure": type(exc).__name__},
+        )
         raise HTTPException(status_code=502, detail=f"OpenAI upstream request failed: {type(exc).__name__}") from exc
 
     content_type = upstream.headers.get("content-type", "application/json")

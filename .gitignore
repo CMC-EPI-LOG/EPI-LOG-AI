@@ -1,4 +1,8 @@
 .env
+.DS_Store
+.omx/
+.venv/
 __pycache__/
 *.pyc
 upload/
+.vercel
