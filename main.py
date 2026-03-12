@@ -14,6 +14,7 @@ from app.services import (
     get_ops_metrics_summary,
     render_ops_dashboard_html,
 )
+from app.health import build_health_payload
 from app.monitoring import capture_exception, initialize_sentry
 from app.openai_proxy import router as openai_proxy_router
 
@@ -85,6 +86,11 @@ def _admin_authorized(request: Request) -> bool:
 @app.get("/")
 def read_root():
     return {"status": "ok", "service": "Epilogue API"}
+
+
+@app.get("/api/healthz")
+async def healthz():
+    return JSONResponse(content=await build_health_payload())
 
 
 @app.get("/api/admin/ops-metrics")
@@ -201,7 +207,7 @@ async def clothing_recommendation(request: ClothingRecommendationRequest):
         if request.airGrade and not air_quality.get("grade"):
             air_quality["grade"] = request.airGrade
 
-        result = get_ai_clothing_recommendation(
+        result = await get_ai_clothing_recommendation(
             request.temperature,
             request.humidity,
             user_profile=request.userProfile,
