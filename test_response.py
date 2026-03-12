@@ -5,7 +5,7 @@ import asyncio
 import json
 from app.services import get_medical_advice
 
-async def test_response_structure():
+async def debug_response_structure():
     """Test that the response includes three_reason and detail_answer fields"""
     
     # Test case: Elementary student with asthma
@@ -71,4 +71,4 @@ async def test_response_structure():
         traceback.print_exc()
 
 if __name__ == "__main__":
-    asyncio.run(test_response_structure())
+    asyncio.run(debug_response_structure())

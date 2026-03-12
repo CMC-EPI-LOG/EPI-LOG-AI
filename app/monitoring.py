@@ -1,8 +1,12 @@
 import os
 from typing import Any, Mapping, Optional
 
-import sentry_sdk
-from sentry_sdk.integrations.fastapi import FastApiIntegration
+try:
+    import sentry_sdk
+    from sentry_sdk.integrations.fastapi import FastApiIntegration
+except ImportError:  # pragma: no cover - optional local dependency fallback
+    sentry_sdk = None
+    FastApiIntegration = None
 
 _SENTRY_INITIALIZED = False
 
@@ -23,6 +27,9 @@ def initialize_sentry() -> bool:
 
     if _SENTRY_INITIALIZED:
         return True
+
+    if sentry_sdk is None or FastApiIntegration is None:
+        return False
 
     dsn = (os.getenv("SENTRY_DSN") or "").strip()
     if not dsn:
@@ -53,7 +60,7 @@ def capture_exception(
     tags: Optional[Mapping[str, str]] = None,
     extra: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
-    if not _SENTRY_INITIALIZED:
+    if not _SENTRY_INITIALIZED or sentry_sdk is None:
         return None
 
     with sentry_sdk.push_scope() as scope:

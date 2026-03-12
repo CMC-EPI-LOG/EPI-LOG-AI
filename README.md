@@ -132,6 +132,9 @@ sequenceDiagram
 - 환경 변수는 `.env` 혹은 Vercel Project Settings에 설정한다.
 - `SENTRY_DSN`이 설정되면 FastAPI 런타임 예외를 Sentry로 전송한다.
 - tracing/profile 수집은 기본 `0`이며, sample rate env를 넣을 때만 활성화된다.
+- `ADVICE_MAX_CONCURRENT_LLM`, `ADVICE_MAX_CONCURRENT_EMBED`로 프로세스 내 동시 실행 budget을 제한한다.
+- `ADVICE_SKIP_LLM_ON_LOW_RISK=1`이면 저위험 케이스는 규칙 기반 응답만으로 종료해 비용과 지연을 줄인다.
+- `OPENAI_PROXY_TOKEN_REQUIRED=1`이면 로컬 외 환경에서 proxy token이 없을 때 `/api/openai/v1/*` 요청을 차단한다.
 
 ## Sentry 운영
 
@@ -160,6 +163,21 @@ sequenceDiagram
 - **Response**
   - `status`: String (`"ok"`)
   - `service`: String (`"Epilogue API"`)
+
+### 1-1) Runtime Health
+
+- **GET** `/api/healthz`
+- **Response**
+  - `ok`: Boolean
+  - `service`: String (`"Epilogue API"`)
+  - `mongoReachable`: Boolean
+  - `openaiConfigured`: Boolean
+  - `vectorSearchEnabled`: Boolean
+  - `cacheReady`: Boolean
+  - `environment`: String
+  - `version`: String
+- **의도**
+  - 웹 BFF와 GitHub scheduled health check가 AI 서버 의존성 상태를 가볍게 점검하는 용도
 
 ### 2) Get Medical Advice (RAG)
 
@@ -218,6 +236,15 @@ CSV 컬럼 반환 규칙:
   1. MongoDB `air_quality_data`
   2. Air Korea fallback API
   3. KMA weather forecast DB에서 최신 온습도 보강
+
+## 운영 기본값
+
+- `ADVICE_MAX_CONCURRENT_LLM=4`
+- `ADVICE_MAX_CONCURRENT_EMBED=2`
+- `ADVICE_SKIP_LLM_ON_LOW_RISK=1`
+- `OPENAI_PROXY_TOKEN_REQUIRED=1`
+
+이 값들은 무료 운영 기준 기본 guardrail이다. LLM/Voyage 장애나 포화가 와도 API는 가능한 한 규칙 기반 fallback body를 유지하도록 설계돼 있다.
   4. Mock data fallback
 
 예시:

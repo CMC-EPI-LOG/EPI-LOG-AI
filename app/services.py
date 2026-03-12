@@ -4,6 +4,7 @@ import csv
 import asyncio
 import html
 import re
+from threading import BoundedSemaphore
 from datetime import datetime, timedelta
 from time import perf_counter
 from zoneinfo import ZoneInfo
@@ -15,6 +16,7 @@ from openai import OpenAI
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from dotenv import load_dotenv
+from app.monitoring import capture_exception
 
 load_dotenv()
 
@@ -621,7 +623,7 @@ def _resolve_air_grades(air_quality: Optional[Dict[str, Any]]) -> Dict[str, str]
     }
 
 
-def get_ai_clothing_recommendation(
+async def get_ai_clothing_recommendation(
     temp: Any,
     humidity: Any,
     user_profile: Optional[Dict[str, Any]] = None,
@@ -634,6 +636,13 @@ def get_ai_clothing_recommendation(
     has_profile_input = bool(user_profile.get("ageGroup")) or bool(user_profile.get("condition"))
     has_air_input = any(air_quality.get(key) for key in ("grade", "pm25Grade", "pm10Grade", "o3Grade"))
     if not (has_profile_input and has_air_input):
+        return fallback_result
+
+    if _should_skip_clothing_llm_for_low_risk(
+        temperature=float(fallback_result.get("temperature") or 22.0),
+        user_profile=user_profile,
+        air_quality=air_quality,
+    ):
         return fallback_result
 
     if not openai_client:
@@ -682,7 +691,10 @@ def get_ai_clothing_recommendation(
     """
 
     try:
-        response = openai_client.chat.completions.create(
+        response = await _run_blocking_with_timeout(
+            ADVICE_LLM_TIMEOUT_MS,
+            openai_client.chat.completions.create,
+            concurrency_gate=_llm_concurrency_gate,
             model=CLOTHING_LLM_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -720,8 +732,21 @@ def get_ai_clothing_recommendation(
         }
     except Exception as e:
         print(f"Error generating AI clothing recommendation: {e}")
+        capture_exception(
+            e if isinstance(e, Exception) else Exception(str(e)),
+            route="/services/clothing-recommendation",
+            extra={
+                "temperature": fallback_result.get("temperature"),
+                "humidity": fallback_result.get("humidity"),
+                "quota_guard_triggered": isinstance(e, BudgetGuardError),
+            },
+        )
         fallback_error = dict(fallback_result)
-        fallback_error["source"] = "rule-based-fallback-on-error"
+        fallback_error["source"] = (
+            "rule-based-fallback-quota-guard"
+            if isinstance(e, BudgetGuardError)
+            else "rule-based-fallback-on-error"
+        )
         return fallback_error
 
 
@@ -1132,6 +1157,22 @@ OPENAI_MAX_RETRIES = _bounded_int_env(
 )
 ADVICE_LLM_MODEL = (os.getenv("ADVICE_LLM_MODEL") or "gpt-4.1-nano").strip() or "gpt-4.1-nano"
 CLOTHING_LLM_MODEL = (os.getenv("CLOTHING_LLM_MODEL") or ADVICE_LLM_MODEL).strip() or ADVICE_LLM_MODEL
+ADVICE_MAX_CONCURRENT_LLM = _bounded_int_env(
+    "ADVICE_MAX_CONCURRENT_LLM",
+    4,
+    min_value=1,
+    max_value=16,
+)
+ADVICE_MAX_CONCURRENT_EMBED = _bounded_int_env(
+    "ADVICE_MAX_CONCURRENT_EMBED",
+    2,
+    min_value=1,
+    max_value=8,
+)
+ADVICE_SKIP_LLM_ON_LOW_RISK = _env_flag("ADVICE_SKIP_LLM_ON_LOW_RISK", True)
+OPENAI_PROXY_TOKEN_REQUIRED = _env_flag("OPENAI_PROXY_TOKEN_REQUIRED", True)
+_llm_concurrency_gate = BoundedSemaphore(ADVICE_MAX_CONCURRENT_LLM)
+_embed_concurrency_gate = BoundedSemaphore(ADVICE_MAX_CONCURRENT_EMBED)
 
 try:
     openai_client = OpenAI(api_key=OPENAI_API_KEY, max_retries=OPENAI_MAX_RETRIES)
@@ -2021,6 +2062,10 @@ def _build_advice_ops_event(
     overlay_used: bool,
     llm_timeout: bool,
     response_fallback_used: bool,
+    llm_skipped: bool = False,
+    quota_guard_triggered: bool = False,
+    cache_tier: str = "miss",
+    response_mode: str = "fallback",
     context_doc_count: int = 0,
     context_chars: int = 0,
 ) -> Dict[str, Any]:
@@ -2055,8 +2100,12 @@ def _build_advice_ops_event(
         "dataFallbackUsed": bool(data_fallback_used),
         "overlayUsed": bool(overlay_used),
         "llmTimeout": bool(llm_timeout),
+        "llmSkipped": bool(llm_skipped),
+        "quotaGuardTriggered": bool(quota_guard_triggered),
         "cacheHit": bool(cache_hit),
         "staleCacheHit": bool(stale_cache_hit),
+        "cacheTier": cache_tier,
+        "responseMode": response_mode,
         "cacheAgeSeconds": cache_age_seconds,
         "stationResolutionStatus": station_resolution_status,
         "stationResolutionFailed": station_resolution_failed,
@@ -2131,6 +2180,8 @@ async def get_ops_metrics_summary(hours: int = 24, recent_limit: int = 50) -> Di
     fallback_count = sum(1 for doc in docs if doc.get("fallbackUsed"))
     overlay_count = sum(1 for doc in docs if doc.get("overlayUsed"))
     llm_timeout_count = sum(1 for doc in docs if doc.get("llmTimeout"))
+    llm_skipped_count = sum(1 for doc in docs if doc.get("llmSkipped"))
+    quota_guard_count = sum(1 for doc in docs if doc.get("quotaGuardTriggered"))
     stale_cache_count = sum(1 for doc in docs if doc.get("staleCacheHit"))
     cache_hit_count = sum(1 for doc in docs if doc.get("cacheHit"))
     station_resolution_failure_count = sum(1 for doc in docs if doc.get("stationResolutionFailed"))
@@ -2159,10 +2210,14 @@ async def get_ops_metrics_summary(hours: int = 24, recent_limit: int = 50) -> Di
             "fallbackUsed": bool(doc.get("fallbackUsed")),
             "overlayUsed": bool(doc.get("overlayUsed")),
             "llmTimeout": bool(doc.get("llmTimeout")),
+            "llmSkipped": bool(doc.get("llmSkipped")),
+            "quotaGuardTriggered": bool(doc.get("quotaGuardTriggered")),
             "cacheHit": bool(doc.get("cacheHit")),
             "staleCacheHit": bool(doc.get("staleCacheHit")),
             "responseFallbackUsed": bool(doc.get("responseFallbackUsed")),
             "dataFallbackUsed": bool(doc.get("dataFallbackUsed")),
+            "cacheTier": doc.get("cacheTier"),
+            "responseMode": doc.get("responseMode"),
             "stationResolutionStatus": doc.get("stationResolutionStatus"),
             "timings": doc.get("timings", {}),
         })
@@ -2174,6 +2229,8 @@ async def get_ops_metrics_summary(hours: int = 24, recent_limit: int = 50) -> Di
         "fallbackRatio": {"count": fallback_count, "ratio": _safe_ratio(fallback_count, total)},
         "overlayUsageRatio": {"count": overlay_count, "ratio": _safe_ratio(overlay_count, total)},
         "llmTimeoutRatio": {"count": llm_timeout_count, "ratio": _safe_ratio(llm_timeout_count, total)},
+        "llmSkippedRatio": {"count": llm_skipped_count, "ratio": _safe_ratio(llm_skipped_count, total)},
+        "quotaGuardRatio": {"count": quota_guard_count, "ratio": _safe_ratio(quota_guard_count, total)},
         "staleCacheUsageRatio": {"count": stale_cache_count, "ratio": _safe_ratio(stale_cache_count, total)},
         "cacheHitRatio": {"count": cache_hit_count, "ratio": _safe_ratio(cache_hit_count, total)},
         "stationResolutionFailureRatio": {
@@ -2186,6 +2243,8 @@ async def get_ops_metrics_summary(hours: int = 24, recent_limit: int = 50) -> Di
         "airSourceBreakdown": breakdown("airSource"),
         "weatherSourceBreakdown": breakdown("weatherSource"),
         "stageBreakdown": breakdown("stage"),
+        "cacheTierBreakdown": breakdown("cacheTier"),
+        "responseModeBreakdown": breakdown("responseMode"),
         "stationResolutionBreakdown": breakdown("stationResolutionStatus"),
         "responseFallbackBreakdown": breakdown("responseFallbackUsed"),
         "dataFallbackBreakdown": breakdown("dataFallbackUsed"),
@@ -2388,12 +2447,88 @@ def _is_voyage_forbidden_error(error: Exception) -> bool:
     return "forbidden" in text or "403" in text
 
 
-async def _run_blocking_with_timeout(timeout_ms: int, func, *args, **kwargs):
+class BudgetGuardError(RuntimeError):
+    pass
+
+
+class AdviceExecutionBudget:
+    def __init__(self) -> None:
+        self.llm_calls = 0
+        self.embed_calls = 0
+        self.llm_skipped = False
+        self.quota_guard_triggered = False
+
+    def consume_llm_call(self) -> bool:
+        if self.llm_calls >= 1:
+            self.quota_guard_triggered = True
+            return False
+        self.llm_calls += 1
+        return True
+
+    def consume_embed_call(self) -> bool:
+        if self.embed_calls >= 1:
+            self.quota_guard_triggered = True
+            return False
+        self.embed_calls += 1
+        return True
+
+
+def _should_skip_advice_llm_for_low_risk(
+    *,
+    final_grade: str,
+    age_group: str,
+    user_condition: str,
+    temp: Optional[float],
+) -> bool:
+    if not ADVICE_SKIP_LLM_ON_LOW_RISK:
+        return False
+    if final_grade not in {"좋음", "보통"}:
+        return False
+    if age_group not in {"elementary_high", "teen_adult"}:
+        return False
+    if user_condition != "general":
+        return False
+    if temp is not None and (temp < 5 or temp > 30):
+        return False
+    return True
+
+
+def _should_skip_clothing_llm_for_low_risk(
+    *,
+    temperature: float,
+    user_profile: Dict[str, Any],
+    air_quality: Dict[str, Any],
+) -> bool:
+    if not ADVICE_SKIP_LLM_ON_LOW_RISK:
+        return False
+    age_group = _normalize_age_group(user_profile.get("ageGroup"))
+    condition_key = _normalize_condition_key(user_profile.get("condition"))
+    if age_group not in {"elementary_high", "teen_adult"}:
+        return False
+    if condition_key != "general":
+        return False
+    if temperature < 8 or temperature > 28:
+        return False
+    overall = _resolve_air_grades(air_quality).get("overall")
+    return overall in {"좋음", "보통"}
+
+
+async def _run_blocking_with_timeout(timeout_ms: int, func, *args, concurrency_gate=None, **kwargs):
     timeout_s = max(timeout_ms, 1) / 1000
-    return await asyncio.wait_for(
-        asyncio.to_thread(func, *args, **kwargs),
-        timeout=timeout_s,
-    )
+    acquired = False
+    if concurrency_gate is not None:
+        acquired = await asyncio.to_thread(concurrency_gate.acquire, True, 0.05)
+        if not acquired:
+            raise BudgetGuardError("concurrency budget exceeded")
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(func, *args, **kwargs),
+            timeout=timeout_s,
+        )
+    finally:
+        if concurrency_gate is not None and acquired:
+            concurrency_gate.release()
 
 
 def _enforce_advice_response_limits(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2810,6 +2945,7 @@ def _generate_cache_key(air_data: Dict[str, Any], user_profile: Dict[str, Any]) 
     # Key format:
     # station:seoul_jongro_pm25:2_pm10:2_o3:1_age:toddler_cond:asthma_obs:202602071300_vals:14_52_0.03_0.009_weather:3_65
     return (
+        f"model:{_normalize_cache_token(ADVICE_LLM_MODEL)}_"
         f"station:{station_key}_"
         f"pm25:{pm25}_pm10:{pm10}_o3:{o3}_"
         f"age:{_normalize_cache_token(age_group)}_cond:{_normalize_cache_token(condition)}_"
@@ -2842,9 +2978,11 @@ async def get_medical_advice(
     """
     request_started_at = perf_counter()
     timings: Dict[str, float] = {}
+    budget = AdviceExecutionBudget()
     cache_hit = False
     stale_cache_hit = False
     cache_age_seconds: Optional[int] = None
+    response_mode = "fallback"
 
     # Step A: Get Air Quality
     air_fetch_started_at = perf_counter()
@@ -2966,6 +3104,10 @@ async def get_medical_advice(
                         overlay_used=overlay_used,
                         llm_timeout=False,
                         response_fallback_used=False,
+                        llm_skipped=False,
+                        quota_guard_triggered=False,
+                        cache_tier="stale" if stale_cache_hit else "shared",
+                        response_mode="deterministic",
                     )
                 )
                 return normalized_cached_data
@@ -2998,67 +3140,52 @@ async def get_medical_advice(
     global _vector_search_skip_notice_emitted
     if vo_client and db is not None and _vector_search_enabled:
         try:
-            # 1. Primary Search
-            embed_result = await _run_blocking_with_timeout(
-                ADVICE_VECTOR_EMBED_TIMEOUT_MS,
-                vo_client.embed,
-                [search_query],
-                model="voyage-3-large",
-                input_type="query",
-            )
-            query_vector = embed_result.embeddings[0]
-            
-            pipeline = [
-                {
-                    "$vectorSearch": {
-                        "index": VECTOR_INDEX,
-                        "path": "embedding",
-                        "queryVector": query_vector,
-                        "numCandidates": 100,
-                        "limit": 3
-                    }
-                },
-                {
-                    "$project": {
-                        "_id": 0,
-                        "text": 1,
-                        "category": 1,
-                        "risk_level": 1,
-                        "source": 1,
-                        "score": {"$meta": "vectorSearchScore"}
-                    }
-                }
-            ]
-            
-            cursor = db[GUIDELINES_COLLECTION].aggregate(pipeline)
-            relevant_docs = await asyncio.wait_for(
-                cursor.to_list(length=3),
-                timeout=max(ADVICE_VECTOR_QUERY_TIMEOUT_MS, 1) / 1000,
-            )
-            
-            # 2. Fallback Search (If no docs found)
-            if not relevant_docs:
-                print("⚠️ Primary search returned no results. Attempting fallback (General) search.")
-                fallback_query = f"{main_condition} 행동 요령"
-                embed_result_fb = await _run_blocking_with_timeout(
+            if budget.consume_embed_call():
+                embed_result = await _run_blocking_with_timeout(
                     ADVICE_VECTOR_EMBED_TIMEOUT_MS,
                     vo_client.embed,
-                    [fallback_query],
+                    [search_query],
+                    concurrency_gate=_embed_concurrency_gate,
                     model="voyage-3-large",
                     input_type="query",
                 )
-                query_vector_fb = embed_result_fb.embeddings[0]
-                
-                pipeline[0]["$vectorSearch"]["queryVector"] = query_vector_fb
-                
+                query_vector = embed_result.embeddings[0]
+
+                pipeline = [
+                    {
+                        "$vectorSearch": {
+                            "index": VECTOR_INDEX,
+                            "path": "embedding",
+                            "queryVector": query_vector,
+                            "numCandidates": 100,
+                            "limit": 3
+                        }
+                    },
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "text": 1,
+                            "category": 1,
+                            "risk_level": 1,
+                            "source": 1,
+                            "score": {"$meta": "vectorSearchScore"}
+                        }
+                    }
+                ]
+
                 cursor = db[GUIDELINES_COLLECTION].aggregate(pipeline)
                 relevant_docs = await asyncio.wait_for(
                     cursor.to_list(length=3),
                     timeout=max(ADVICE_VECTOR_QUERY_TIMEOUT_MS, 1) / 1000,
                 )
+            else:
+                print("⚠️ Vector search skipped due to per-request embed budget")
 
         except Exception as e:
-            if _is_voyage_forbidden_error(e):
+            if isinstance(e, BudgetGuardError):
+                budget.quota_guard_triggered = True
+                print(f"⚠️ Vector search skipped by concurrency budget: {e}")
+            elif _is_voyage_forbidden_error(e):
                 _vector_search_enabled = False
                 print(f"⚠️ Vector search disabled due to forbidden error: {e}")
             elif _is_timeout_error(e):
@@ -3068,7 +3195,15 @@ async def get_medical_advice(
                 )
             else:
                 print(f"Error during vector search: {e}")
-            pass
+            capture_exception(
+                e if isinstance(e, Exception) else Exception(str(e)),
+                route="/services/advice/vector-search",
+                tags={"station.requested": station_name},
+                extra={
+                    "search_query": search_query,
+                    "quota_guard_triggered": budget.quota_guard_triggered,
+                },
+            )
     elif vo_client and db is not None and not _vector_search_enabled and not _vector_search_skip_notice_emitted:
         _vector_search_skip_notice_emitted = True
         print("⚠️ Vector search skipped (disabled)")
@@ -3114,6 +3249,44 @@ async def get_medical_advice(
     if GRADE_MAP.get(pm25_corrected, 1) >= 3 and GRADE_MAP.get(o3_corrected, 1) >= 3:
         decision_text += " (미세먼지와 오존 둘 다 높아요!)"
 
+    if _should_skip_advice_llm_for_low_risk(
+        final_grade=final_grade,
+        age_group=age_group,
+        user_condition=user_condition,
+        temp=_coerce_number(temp),
+    ):
+        budget.llm_skipped = True
+        timings["total_ms"] = round((perf_counter() - request_started_at) * 1000, 1)
+        _log_advice_timing(station_name, cache_hit=cache_hit, timings=timings, stage="llm_skipped")
+        deterministic_result = _build_deterministic_advice_payload(
+            decision_text=decision_text,
+            csv_reason=csv_reason or "",
+            action_items=action_items,
+            air_data=air_data,
+        )
+        await _record_advice_ops_event(
+            _build_advice_ops_event(
+                station_name=station_name,
+                air_data=air_data,
+                air_fetch_mode=air_data_source,
+                stage="llm_skipped",
+                timings=timings,
+                cache_hit=cache_hit,
+                stale_cache_hit=stale_cache_hit,
+                cache_age_seconds=cache_age_seconds,
+                overlay_used=overlay_used,
+                llm_timeout=False,
+                response_fallback_used=False,
+                llm_skipped=True,
+                quota_guard_triggered=budget.quota_guard_triggered,
+                cache_tier="shared" if cache_hit else "miss",
+                response_mode="deterministic",
+                context_doc_count=context_doc_count,
+                context_chars=context_chars,
+            )
+        )
+        return deterministic_result
+
     if not openai_client:
         timings["total_ms"] = round((perf_counter() - request_started_at) * 1000, 1)
         _log_advice_timing(station_name, cache_hit=cache_hit, timings=timings, stage="no_openai_client")
@@ -3137,6 +3310,10 @@ async def get_medical_advice(
                 overlay_used=overlay_used,
                 llm_timeout=False,
                 response_fallback_used=True,
+                llm_skipped=False,
+                quota_guard_triggered=budget.quota_guard_triggered,
+                cache_tier="stale" if stale_cache_hit else ("shared" if cache_hit else "miss"),
+                response_mode="fallback",
                 context_doc_count=context_doc_count,
                 context_chars=context_chars,
             )
@@ -3179,9 +3356,13 @@ async def get_medical_advice(
 
     llm_started_at = perf_counter()
     try:
+        if not budget.consume_llm_call():
+            raise BudgetGuardError("per-request llm budget exceeded")
+
         response = await _run_blocking_with_timeout(
             ADVICE_LLM_TIMEOUT_MS,
             openai_client.chat.completions.create,
+            concurrency_gate=_llm_concurrency_gate,
             model=ADVICE_LLM_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -3241,6 +3422,7 @@ async def get_medical_advice(
             f"station={station_name} context_docs={context_doc_count} "
             f"context_chars={context_chars} detail_max_chars={ADVICE_DETAIL_MAX_CHARS}"
         )
+        response_mode = "rag" if context_doc_count > 0 else "llm"
         
         # [Step F] Save to Cache
         if db is not None and cache_key:
@@ -3280,6 +3462,10 @@ async def get_medical_advice(
                 overlay_used=overlay_used,
                 llm_timeout=False,
                 response_fallback_used=False,
+                llm_skipped=budget.llm_skipped,
+                quota_guard_triggered=budget.quota_guard_triggered,
+                cache_tier="stale" if stale_cache_hit else ("shared" if cache_hit else "miss"),
+                response_mode=response_mode,
                 context_doc_count=context_doc_count,
                 context_chars=context_chars,
             )
@@ -3291,10 +3477,23 @@ async def get_medical_advice(
         timings["total_ms"] = round((perf_counter() - request_started_at) * 1000, 1)
         _log_advice_timing(station_name, cache_hit=cache_hit, timings=timings, stage="llm_error")
         llm_timeout = _is_timeout_error(e)
-        if _is_timeout_error(e):
+        if isinstance(e, BudgetGuardError):
+            budget.quota_guard_triggered = True
+            print(f"⚠️ LLM skipped by concurrency budget: station={station_name}")
+        elif _is_timeout_error(e):
             print(f"⚠️ LLM call timed out: station={station_name} timeout_ms={ADVICE_LLM_TIMEOUT_MS}")
         else:
             print(f"Error calling OpenAI: {e}")
+        capture_exception(
+            e if isinstance(e, Exception) else Exception(str(e)),
+            route="/services/advice/llm",
+            tags={"station.requested": station_name},
+            extra={
+                "quota_guard_triggered": budget.quota_guard_triggered,
+                "llm_timeout": llm_timeout,
+                "context_doc_count": context_doc_count,
+            },
+        )
         fallback_result = _build_deterministic_advice_payload(
             decision_text=decision_text,
             csv_reason=csv_reason or "",
@@ -3314,6 +3513,10 @@ async def get_medical_advice(
                 overlay_used=overlay_used,
                 llm_timeout=llm_timeout,
                 response_fallback_used=True,
+                llm_skipped=budget.llm_skipped,
+                quota_guard_triggered=budget.quota_guard_triggered,
+                cache_tier="stale" if stale_cache_hit else ("shared" if cache_hit else "miss"),
+                response_mode="fallback",
                 context_doc_count=context_doc_count,
                 context_chars=context_chars,
             )
